@@ -2,97 +2,101 @@
 
 *A blog post + a freebie. The repo is at the bottom.*
 
-[GARY: optional standfirst — one-line tease. Skip if it feels like padding.]
-
 ---
 
-## I wanted to talk to my context
+## The brainstorming partner I couldn't actually have
 
-Pulling this verbatim from a note I dictated into Obsidian a couple weeks ago, mostly so I don't sand the edges off it before you see what actually started this:
+There's a kind of conversation I always wanted and could never really get.
 
-> I always wanted to have deep in-depth technical conversations with an endlessly knowledgeable person that has the exact deep context needed to brainstorm something novel together. Often when I want this it's when I'm trying to learn something — I'm trying to understand the physics behind something, or how to do some intricate piece of math that I didn't bother to learn while I was in school because I had no direct use for it at the time. I really couldn't have that without bending the ear of somebody who is a very credible expert, whose time is valuable, who I would almost certainly annoy with my very basic and dumb questions and my questioning of the realities that they're assuming. So it doesn't make for a very effective or frequent brainstorming session. This was kind of a big blocker in my life as a product builder, and generally as a curious person or as a professional. And now we have a solution.
+The setup is something like this: I'm trying to learn something hard — a piece of physics behind something I'm building, an intricate piece of math I never bothered with in school, an architectural decision I can feel is wrong but can't yet say why. What I want is to talk it through with someone who actually knows the territory and who has the exact context for what I'm working on. Not a tutor. Not a Stack Overflow thread. A *brainstorming partner*.
 
-[GARY: connector — half a paragraph. The "and now we have a solution" pivot. Resist the urge to over-set-up.]
+The problem is that the right person for that conversation is, by definition,
 
-## The missing interface wasn't intelligence — it was context
+> an expert whose time is valuable, who I would almost certainly annoy with my very basic and dumb questions and my questioning of the realities that they're assuming.
 
-[GARY: one paragraph. The point: GPT-5 / Claude / Gemini are smart enough; the bottleneck for the kind of conversation I wanted was that none of them knew what *I* was working on, what I'd already tried, what the current state of my thinking was. The "expert friend" experience was always blocked by setup cost.]
+So the conversation never happens. Or it happens once, badly, and then I stop reaching out because I don't want to be the guy.
 
-[GARY: one more paragraph. Your stack now: Hermes agent + LLM-wiki + skills + persistent project memory + Slack/Obsidian/Drive plumbing. It all adds up to a thing that knows your world. The agent isn't smarter than the underlying model. It's just *contextual*.]
+This was a real blocker for me — as a product builder, as a curious person, as a professional. I worked around it for years. Now I don't have to.
 
-## Why live voice products dodge deep context
+[GARY: optional half-paragraph — the "and now we have a solution" pivot. Keep it short; the rest of the post is the explanation.]
 
-[GARY: this is the technically interesting middle. Premise: ChatGPT Live Voice is great — low latency, natural turn-taking, barge-in. But it does not deeply inhabit your local tools, repos, notes, memory, Slack history, project state. There's a structural reason: if you let the voice model phone-home to a heavyweight context-aware agent on every turn, you eat 10–30s of latency on the deep questions. That ruins the conversational feel. So consumer products optimize for low-latency-shallow over high-latency-deep.]
+## Why this works now
 
-[GARY: pivot — that's the right call for a consumer product. It is the wrong call for *me*, because I'm not trying to ask Live Voice what the weather is. I'm trying to brainstorm.]
+The honest answer is not "AI got smarter." Frontier models have been smart enough for this for a while. What changed is that the *context* layer around the model finally got buildable.
 
-## The architecture I landed on
-
-The thing I built is called Hermes Mini personally and **Talk to Your Context** as the open-source version. It's a browser PWA + a small Python sidecar:
-
-- **Browser ↔ OpenAI Realtime over WebRTC.** This handles barge-in, natural turn-taking, the conversational feel. The Realtime model is the fast, shallow brain.
-- **Function bridge to my actual agent.** When a question is substantive, the Realtime model calls `ask_agent`, which routes the question through the full Hermes loop — skills, retrieval, tools, memory.
-- **A "thinking" affordance.** Brown noise + a visual cue while the deep call runs. Honest about the latency rather than hiding it.
-- **Text mode fallback.** For when I want to type or when the deep response is long.
-- **Transcript persistence + post-call ingestion.** Every call gets saved as JSON; a summary gets ingested back into the agent's memory, so the *next* call starts with the *previous* call as context. The thing learns.
-- **Optional Slack archive.** Each call posts to a private Slack thread so I can search past conversations the same way I search any work channel.
-- **Tailnet-only by default.** Tailscale CIDR allowlist. Private by default. Not internet-exposed.
-
-[GARY: half a paragraph on *why* this combination. The single design choice: split the brain. Fast model for turn-taking, real agent for substance. Most consumer products won't ship this because of the visible latency on deep calls. For my use case, the latency is fine — I'd rather wait 8 seconds for a real answer than get an instant shallow one.]
-
-## What works surprisingly well
-
-[GARY: 3–5 short paragraphs. Concrete. Examples from real calls.]
-
-- The transcript-feeds-back-into-memory loop is the part I underestimated. Each call leaves a residue.
-- Barge-in actually matters more than I thought. Being able to interrupt the model mid-thought is the difference between "expert friend" and "lecture."
-- [GARY: one personal moment. The kind of brainstorm you couldn't have had with anyone else.]
-
-## What's still imperfect
-
-Honest list:
-
-- **Deep-context calls lag.** 5–20 seconds depending on the question. There's no way around this with current architectures — context retrieval + agent loop takes real wall time. The brown-noise affordance helps but doesn't eliminate the friction.
-- **Single-user.** Auth is local-first / Tailscale. Multi-user with proper isolation is a different product.
-- **Local-first assumption.** Requires you to be running a local agent with an OpenAI-compatible API. This is a specific kind of person's setup. (Hermes is the documented default; the adapters layer means it's not the only option.)
-- **Transcript ingestion is summary-quality.** The agent remembers the *gist* of past calls, not the verbatim. Good enough for me; might not be for everyone.
-
-[GARY: one paragraph admitting these — and then saying why it's still useful. Worth-the-tradeoff framing.]
-
-## Context management is the new engineering
-
-[GARY: this is the thesis section. The goal: make the case clearly enough that someone who's been hand-prompting their way through the last year goes "oh, I see what's actually leveraged here."]
-
-Andrej Karpathy frames this directly. He calls the context window "your lever over the interpreter" — meaning, in Software 3.0, what you put into context is the program. You're not writing code; you're arranging context.
+Andrej Karpathy framed it cleanly in his recent Sequoia talk:
 
 > "What's in the context window is your lever over the interpreter."
-> — Karpathy, *From Vibe Coding to Agentic Engineering*, Sequoia AI Ascent 2026
 
-He goes further. In the same talk he says people who are very good at context engineering and model tuning can peak "a lot more than 10x" — because the upside compounds through orchestration, calibration, and workflow design, not raw prompting speed.
+Treat that literally. In the Software 3.0 framing, the context window *is* the program. The model is a stochastic interpreter. What you arrange in front of it — your notes, your skills, your retrieval, your memory, your tools, your verification — that's the code. The actual engineering happens before the model ever sees a token.
 
-[GARY: one paragraph connecting this to the product. The reason "Talk to Your Context" works isn't because GPT-realtime is brilliant. It's because it's coupled to a context layer — the LLM-wiki, the skills, the persistent memory — that *I* built up over months. The interface is voice; the substance is the context. If you stripped the agent out and just talked to Realtime, you'd have a chatty assistant with no memory of your world.]
+That reframing makes a lot of recent confusion settle. Why do some people get 10x leverage out of these tools while others write half a feature and call it a day? Karpathy answered that too — he said people who are very good at this can peak "a lot more than 10x," because context engineering and model tuning compound. That's not a prompt-typing-speed gap. It's an engineering gap.
 
-[GARY: optional aside on jagged intelligence. Karpathy's car-wash example is a good throwaway here — frontier models can refactor a huge codebase but tell you to walk to a car wash 50 meters away when the actual goal was to wash the car. Fluency isn't reliability. The cure is context, supervision, and knowing where the model's strong circuits actually are. Tie back: my agent isn't smarter than the base model; it's just better-supervised, better-contextualized, and routed through skills that have been tuned for the specific tasks I care about.]
+There's a corollary that anti-hype people will appreciate. Frontier models are *jagged*: they can refactor a huge codebase or find a vulnerability and then turn around and tell you to walk to a car wash 50 meters away when the actual goal was to wash the car. Fluency isn't reliability. The cure isn't better prompts; it's better *supervision* — context, evals, retrieval, the whole layer that keeps a brilliant-but-spiky model pointed at the right circuit. Context engineering is what makes jagged intelligence usable.
 
-[GARY: closing pull on the thesis. Something like: the people getting outsized leverage from AI right now aren't the people typing prompts faster. They're the people who built up a context layer over time — notes, skills, retrieval, evals, persistent memory — and figured out how to plug the model into it. That's an engineering discipline. It looks like writing prose because it produces text artifacts, but the loops are the same as any other system: design, test, observe, iterate.]
+Which is what makes this the engineering discipline of the next several years. Not bigger models. Better context.
+
+## The thing I built
+
+I built it for myself first, on my own machine. The personal version is called Hermes Mini. The open-source version I'm releasing today is called **Talk to Your Context**.
+
+Architecturally it's a small stack:
+
+- **Browser PWA ↔ OpenAI Realtime over WebRTC.** This handles barge-in, natural turn-taking, the conversational feel. The Realtime model is the fast, shallow brain — it's the part that makes it feel like talking to a person.
+- **Function bridge to my actual agent.** When a question is substantive, the Realtime model calls `ask_agent`, which routes through the full agent loop — skills, retrieval, tools, memory. That's where the context lives.
+- **A "thinking" affordance.** Brown noise + a visual cue while the deep call runs. Honest about the latency rather than hiding it.
+- **Text-mode fallback.** For when I want to type, or for long answers I'd rather read than hear.
+- **Transcript persistence + post-call ingestion.** Every call gets saved as JSON; a summary gets folded back into the agent's memory so the *next* call starts where this one ended. The thing learns.
+- **Optional Slack archive.** Each call becomes a private Slack thread, searchable like any other channel.
+- **Tailnet-only by default.** Loopback or Tailscale CIDR allowlist. Private by default. Not internet-exposed.
+
+The defining design choice is splitting the brain. Realtime model for turn-taking; real agent for substance. Most consumer voice products won't ship this because of the visible latency on deep calls — and that's the right call for them. It is the wrong call for me, because I'm not asking the live voice what the weather is. I'm asking it to think with me.
+
+[GARY: optional concrete moment — one real brainstorming session this enabled. Half a paragraph. The kind that lands harder than feature bullets.]
+
+## What works, and what doesn't
+
+A few things I underestimated:
+
+- **The transcript-feeds-back-into-memory loop matters more than the voice does.** Each call leaves a residue. After two weeks the agent feels less like a tool and more like a colleague who was on the last call too.
+- **Barge-in is what makes it brainstorming, not lecture.** Being able to interrupt mid-sentence is the difference between a conversation and a podcast. I didn't realize how much that mattered until I had it.
+- **The systems mindset transfers.** I'm a CPA-turned-builder. Internal controls, business systems, finance ops — that's the lane I came from. Building a context layer is the same kind of work: you're designing the machinery around something stochastic so it produces reliable output. Operators get this in their bones; engineers sometimes have to learn it.
+
+What's still imperfect, said honestly:
+
+- **Deep-context calls lag.** Five to twenty seconds depending on the question. There's no way around this with current architectures — context retrieval plus agent loop takes real wall time. The brown-noise affordance helps but doesn't eliminate the friction. This is probably why ChatGPT Live Voice doesn't ship this architecture: the latency would feel broken to a general audience. For the brainstorming use case, I'll wait eight seconds for an answer that knows my world.
+- **Single-user.** Auth is local-first. Multi-user with proper isolation is a different product.
+- **Local-first assumption.** You need to be running a local agent with an OpenAI-compatible API. That's a specific kind of person's setup. (Hermes is the documented default; the adapters layer means it's not the only option.)
+- **Transcript ingestion is summary-quality, not verbatim.** Good enough for me. Might not be for everyone.
+
+## A note on agent harnesses
+
+While I'm here: it has never been more tempting to build a crazy complex agent harness — multi-agent orchestration, sub-agents that hire sub-agents, a 47-step ReAct loop with tool-routing on every turn. **It's a trap.**
+
+The right model is leaner. Hire agents the way you'd add new roles to a lean team. One agent with a good context layer and the right three skills will out-perform a baroque multi-agent harness on almost any real task — and you can actually debug it when it goes sideways. Talk to Your Context is small on purpose. Most of the complexity I cared about lives in the *context* layer (the LLM-wiki, the skills, the persistent memory) — not in the agent topology.
+
+That distinction is the one I'd want a reader to take away. Context is leverage. Harnesses are mostly LARP-ing.
 
 ## Here's the repo
 
-`github.com/brklyngg/talk-to-your-context` — MIT, give-it-away.
+[`github.com/brklyngg/talk-to-your-context`](https://github.com/brklyngg/talk-to-your-context) — MIT, give-it-away.
 
-Default backend is Hermes (because that's what I run). The adapters layer means you can plug in any local agent that exposes an OpenAI-compatible chat completions endpoint — `ollama serve`, vLLM, your own thing. There are README stubs for swapping the Slack transcript archive to Telegram, Discord, Matrix, or email.
+Default backend is Hermes (because that's what I run). The adapters layer means you can plug in any local agent that exposes an OpenAI-compatible chat-completions endpoint — `ollama serve`, vLLM, your own thing. There are README stubs for swapping the Slack transcript archive to Telegram, Discord, Matrix, or email. If you build an adapter, send a PR.
 
-Setup is the standard clone-install-env pattern; full instructions in the README. It assumes you already have a running local agent. If you don't, the [Hermes docs] are the easiest starting point. [GARY: link]
+I'm releasing it as a freebie because the tools that taught me to build were freebies. Open source is its own pay-it-forward economy and I'd like to be in it. If you make something better with this, I want to hear about it.
 
-If you build an adapter, send a PR.
-
-[GARY: closing line. Personal, short. Something like: this is the interface I wanted; if it's also the interface you wanted, we're in the same boat.]
+[GARY: closing line. Personal, short. The "this is the interface I wanted; if it's also the interface you wanted, we're in the same boat" energy from the earlier draft is still good if you want it. Or something simpler.]
 
 ---
 
-*Draft notes for Gary:*
-- Word count target: 1,200–1,800. Skeleton above is roughly 700 of mine + your filler. You'll land in range easily.
-- Karpathy is `authority: medium / opinion / verify=true` per the wiki — phrased as "Karpathy frames" / "He goes further" rather than "Karpathy proved." Keep it that way on polish.
-- The Obsidian quote at top is voice-dictated — I cleaned grammar but kept the cadence. Decide whether to clean further or leave it raw as "this is what the unprocessed thought looked like."
-- I left the car-wash + chess examples as optional. They earn their place if you're going essay-long; cut them if you're going essay-tight.
-- The "more than 10x" line is a direct quote from Karpathy. Worth keeping verbatim.
+*Notes for Gary on this re-cut:*
+- ~1,250 words before your fills — comfortably in the 1,200–1,800 range.
+- New opener per the sweep recommendation: human blocker first, tech second. "Annoying expert" pull-quote is the hook.
+- Karpathy quote is now spine, not garnish. Used twice (lever, 10x). Phrased as "framed it cleanly" / "answered" — within the medium-authority caveat.
+- Anti-harness section added per the "lean team, not harness" POV. This is the differentiator from the AI-twitter complexity arms race.
+- Reframed away from productivity-tool toward cognition-extension / brainstorming-substrate.
+- "Systems guy" identity beat folded into "what works".
+- Pay-it-forward / open-source ethos beat in the closing.
+- Removed: the original "Why live voice products dodge deep context" mini-section — its content got absorbed into "thing I built" + "what's still imperfect", so it was redundant.
+- Pull-quotes used: dumb-questions line ✓, Karpathy lever ✓, Karpathy 10x ✓, harness-trap ✓ (paraphrased into the section). The team-transcripts-compounding line didn't fit because this post is about personal use; save it for a Crunchy Numbers post.
+- Builder-metaphor cluster (vampire / zebra / Nintendo-64) deliberately not used here — those belong in their own short post per the sweep's "Top 3" #3.

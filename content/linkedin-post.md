@@ -1,25 +1,27 @@
-I built the interface I wanted: live voice with my actual working context.
+The brainstorming partner I always wanted is
 
-[GARY: one-line setup. Why I built it: I wanted brainstorming-with-an-expert-friend conversations, not Q&A. Off-the-shelf voice products are great at conversation but don't know what I'm working on, what I've already tried, or where I'm stuck. The bottleneck wasn't intelligence — it was context.]
+> an expert whose time is valuable, who I would almost certainly annoy with my very basic and dumb questions and my questioning of the realities that they're assuming.
 
-What it does:
-— Browser PWA + WebRTC to OpenAI Realtime for natural turn-taking and barge-in
-— Function call into my Hermes agent for the substantive questions, so it answers from my actual notes/skills/memory/Slack history
-— Brown-noise "thinking" affordance during deep calls so the latency is honest, not hidden
-— Transcript persistence + post-call summary fed back into agent memory, so the next call starts where the last one ended
+So I worked around it for years. I shipped a thing this week that finally fixes it for me, and I'm open-sourcing it.
 
-Honest caveat: deep-context calls lag 5–20 seconds. Real retrieval + agent loop takes real time. That's probably why ChatGPT Live Voice doesn't ship this architecture — the latency would feel broken to a general audience. For the brainstorming use case, the trade is worth it. I'll wait eight seconds for an answer that knows my world.
+It's a live voice + text interface to my own agent. Browser PWA + a small Python sidecar. Realtime model handles the conversational feel (barge-in, turn-taking); when a question is substantive, it routes through my agent's full loop — skills, retrieval, memory, tools — so the answer comes back from my actual working context, not a stranger.
 
-I'm open-sourcing it: [github.com/brklyngg/talk-to-your-context]. MIT. Default backend is Hermes; adapters scaffolded for Slack archive (and stubs for Telegram/Discord/Matrix).
+The thing I underestimated: transcripts get summarized back into the agent's memory after every call. Each conversation leaves a residue. After two weeks it stopped feeling like a tool.
 
-[GARY: thesis close — one or two sentences. The frame Karpathy makes ("the context window is your lever") is starting to feel right. The leverage from AI isn't from typing prompts faster; it's from building up a context layer the model can plug into. Writing this off as "just AI stuff" misses where the actual engineering is moving.]
+Honest caveat: deep-context calls lag 5–20 seconds. Real retrieval and a real agent loop take real wall time. That's almost certainly why consumer Live Voice products don't ship this architecture — the latency would feel broken to a general audience. For brainstorming, I'll wait eight seconds for an answer that knows my world.
 
-[Blog: link to crunchy.tools]
+Karpathy's framing has been on my mind: "what's in the context window is your lever over the interpreter." The leverage from AI right now isn't from typing prompts faster. It's from building up a context layer the model can plug into. That layer is the engineering.
+
+[github.com/brklyngg/talk-to-your-context] — MIT. Default backend is Hermes; adapter stubs for Telegram/Discord/Matrix if you don't run Slack.
+
+Full write-up: [crunchy.tools link]
 
 ---
 
-*Draft notes for Gary:*
-- Target 200–300 words. Above is ~230 with your fills, which lands clean.
-- No hashtags, no "agree?" CTA, no listicle formatting — voice skill anti-patterns.
-- "Brown-noise thinking affordance" is the kind of concrete detail the voice skill says is good — could only Gary write this.
-- The Karpathy framing in the close is paraphrased ("the context window is your lever") not quoted — feels lighter for LinkedIn. Quote it directly if you want.
+*Notes for Gary:*
+- ~270 words. Within the 200–300 target.
+- Opens with the same human-blocker hook as the blog (per sweep recommendation). The "dumb questions" pull-quote does heavy lifting.
+- Bullets gone — sweep flagged listicle formatting on LinkedIn as a voice-skill anti-pattern. Replaced with prose.
+- Karpathy quote attributed; "leverage from AI isn't typing prompts faster" is the close.
+- No hashtags, no "agree?" CTA, no engagement bait.
+- The "anti-harness" angle is *not* in this draft — it's a longer thought that needs the blog to land. LinkedIn keeps tighter scope.
