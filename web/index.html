@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0e0f11">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Agent">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/static/icon-512.png">
+  <link rel="stylesheet" href="/static/styles.css">
+  <title>Talk to Your Context</title>
+</head>
+<body>
+  <main id="app">
+    <header>
+      <div class="brand">
+        <span class="dot" id="health-dot" aria-hidden="true"></span>
+        <span>Talk to Your Context</span>
+      </div>
+      <div class="status" id="status">idle</div>
+    </header>
+
+    <section id="transcript" aria-live="polite" aria-label="Live transcript"></section>
+
+    <section id="text-mode" hidden>
+      <form id="text-form">
+        <input type="text" id="text-input" placeholder="Type to your agent (bypasses voice)" autocomplete="off">
+        <button type="submit" id="text-send">Send</button>
+      </form>
+    </section>
+
+    <footer>
+      <button id="text-toggle" class="ghost" title="Type instead of speak">&#9000;</button>
+      <button id="mute" class="ghost" title="Mute mic" disabled>&#128263;</button>
+      <button id="talk" class="primary">Talk</button>
+      <button id="end" class="danger" hidden>End</button>
+    </footer>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

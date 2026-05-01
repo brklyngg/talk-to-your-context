@@ -1,0 +1,12 @@
+{
+  "name": "Talk to Your Context",
+  "short_name": "Agent",
+  "description": "Live voice line to your agent",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0e0f11",
+  "theme_color": "#0e0f11",
+  "icons": [
+    { "src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

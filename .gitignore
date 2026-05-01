@@ -1,0 +1,38 @@
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+.agent-api-key
+.hermes-api-key
+*.key
+*.pem
+secrets.json
+
+# Runtime data
+logs/
+transcripts/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / web
+node_modules/
+*.log
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
