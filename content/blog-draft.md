@@ -1,6 +1,8 @@
-# Context is the new engineering
+# I built the live voice interface I wanted: talk to your context
 
 *A blog post + a freebie. The repo is at the bottom.*
+
+> Companion to an earlier post on Karpathy's framing for finance teams. That one argues *why* context is the lever; this one shows what one feels like as a working product.
 
 ---
 
@@ -18,31 +20,27 @@ So the conversation never happens. Or it happens once, badly, and then I stop re
 
 This was a real blocker for me — as a product builder, as a curious person, as a professional. I worked around it for years. Now I don't have to.
 
-[GARY: optional half-paragraph — the "and now we have a solution" pivot. Keep it short; the rest of the post is the explanation.]
+[GARY: optional half-paragraph — the "and now we have a solution" pivot. Keep it short.]
 
-## Why this works now
+## Why I built it instead of using something off the shelf
 
-The honest answer is not "AI got smarter." Frontier models have been smart enough for this for a while. What changed is that the *context* layer around the model finally got buildable.
+I wrote earlier this week about [Karpathy's framing](LINK_TO_KARPATHY_FOR_FINANCE) — the context window is the lever, frontier intelligence is jagged, and the leverage compounds for the people who build the layer around the model rather than chasing whichever model is currently leading. If you haven't read that, the short version is: the engineering happens *before* the model sees a token, in the context layer.
 
-Andrej Karpathy framed it cleanly in his recent Sequoia talk:
+This post is what that frame looks like when you turn it into a working product.
 
-> "What's in the context window is your lever over the interpreter."
+The off-the-shelf live-voice products are excellent at the *conversation* part. Low latency, natural turn-taking, barge-in. What none of them do is talk to *my context* — my notes, my agent's skills, my project memory, my Slack history, the residue of every other call I've had on the same problem. Without that, they're a smart stranger. With it, they're a colleague.
 
-Treat that literally. In the Software 3.0 framing, the context window *is* the program. The model is a stochastic interpreter. What you arrange in front of it — your notes, your skills, your retrieval, your memory, your tools, your verification — that's the code. The actual engineering happens before the model ever sees a token.
+So I built the smaller half of the gap myself.
 
-That reframing makes a lot of recent confusion settle. Why do some people get 10x leverage out of these tools while others write half a feature and call it a day? Karpathy answered that too — he said people who are very good at this can peak "a lot more than 10x," because context engineering and model tuning compound. That's not a prompt-typing-speed gap. It's an engineering gap.
-
-There's a corollary that anti-hype people will appreciate. Frontier models are *jagged*: they can refactor a huge codebase or find a vulnerability and then turn around and tell you to walk to a car wash 50 meters away when the actual goal was to wash the car. Fluency isn't reliability. The cure isn't better prompts; it's better *supervision* — context, evals, retrieval, the whole layer that keeps a brilliant-but-spiky model pointed at the right circuit. Context engineering is what makes jagged intelligence usable.
-
-Which is what makes this the engineering discipline of the next several years. Not bigger models. Better context.
+[GARY: optional bridge sentence here. The section can also land on "the smaller half of the gap myself" and move on.]
 
 ## The thing I built
 
-I built it for myself first, on my own machine. The personal version is called Hermes Mini. The open-source version I'm releasing today is called **Talk to Your Context**.
+The personal version is called Hermes Mini. The open-source version I'm releasing today is **Talk to Your Context**.
 
 Architecturally it's a small stack:
 
-- **Browser PWA ↔ OpenAI Realtime over WebRTC.** This handles barge-in, natural turn-taking, the conversational feel. The Realtime model is the fast, shallow brain — it's the part that makes it feel like talking to a person.
+- **Browser PWA ↔ OpenAI Realtime over WebRTC.** Handles barge-in, natural turn-taking, conversational feel. The Realtime model is the fast, shallow brain.
 - **Function bridge to my actual agent.** When a question is substantive, the Realtime model calls `ask_agent`, which routes through the full agent loop — skills, retrieval, tools, memory. That's where the context lives.
 - **A "thinking" affordance.** Brown noise + a visual cue while the deep call runs. Honest about the latency rather than hiding it.
 - **Text-mode fallback.** For when I want to type, or for long answers I'd rather read than hear.
@@ -52,7 +50,7 @@ Architecturally it's a small stack:
 
 The defining design choice is splitting the brain. Realtime model for turn-taking; real agent for substance. Most consumer voice products won't ship this because of the visible latency on deep calls — and that's the right call for them. It is the wrong call for me, because I'm not asking the live voice what the weather is. I'm asking it to think with me.
 
-[GARY: optional concrete moment — one real brainstorming session this enabled. Half a paragraph. The kind that lands harder than feature bullets.]
+[GARY: optional concrete moment — one real brainstorming session this enabled. Half a paragraph. Lands harder than feature bullets.]
 
 ## What works, and what doesn't
 
@@ -85,18 +83,14 @@ Default backend is Hermes (because that's what I run). The adapters layer means 
 
 I'm releasing it as a freebie because the tools that taught me to build were freebies. Open source is its own pay-it-forward economy and I'd like to be in it. If you make something better with this, I want to hear about it.
 
-[GARY: closing line. Personal, short. The "this is the interface I wanted; if it's also the interface you wanted, we're in the same boat" energy from the earlier draft is still good if you want it. Or something simpler.]
+[GARY: closing line. Personal, short.]
 
 ---
 
-*Notes for Gary on this re-cut:*
-- ~1,250 words before your fills — comfortably in the 1,200–1,800 range.
-- New opener per the sweep recommendation: human blocker first, tech second. "Annoying expert" pull-quote is the hook.
-- Karpathy quote is now spine, not garnish. Used twice (lever, 10x). Phrased as "framed it cleanly" / "answered" — within the medium-authority caveat.
-- Anti-harness section added per the "lean team, not harness" POV. This is the differentiator from the AI-twitter complexity arms race.
-- Reframed away from productivity-tool toward cognition-extension / brainstorming-substrate.
-- "Systems guy" identity beat folded into "what works".
-- Pay-it-forward / open-source ethos beat in the closing.
-- Removed: the original "Why live voice products dodge deep context" mini-section — its content got absorbed into "thing I built" + "what's still imperfect", so it was redundant.
-- Pull-quotes used: dumb-questions line ✓, Karpathy lever ✓, Karpathy 10x ✓, harness-trap ✓ (paraphrased into the section). The team-transcripts-compounding line didn't fit because this post is about personal use; save it for a Crunchy Numbers post.
-- Builder-metaphor cluster (vampire / zebra / Nintendo-64) deliberately not used here — those belong in their own short post per the sweep's "Top 3" #3.
+*Notes for Gary on this re-cut (post-bifurcation):*
+- The Karpathy thesis (jagged intelligence, car-wash, chess, "context window is the lever," 10x ceiling, "outsource thinking not understanding") has been removed from this post. It now lives in the **Karpathy for Finance Teams** post, which is assumed published before this one drops.
+- Replaced the deleted "Why this works now" section with a one-paragraph bridge that links to that post (`LINK_TO_KARPATHY_FOR_FINANCE` placeholder — fill once that crunchy.tools URL exists).
+- Removed the Karpathy quote from the LinkedIn close (the prereq post already used it; double-billing the same source on LinkedIn within a week dilutes both posts).
+- Anti-harness section stays — it's product-philosophy adjacent, not Karpathy translation.
+- Result: tighter post, sharper product focus, no double-billing on the thesis. Post is now ~1,000 words before your fills (was ~1,250). The shorter shape suits the product-release frame.
+- Pull-quotes still used here: the "annoying expert" line and the harness-trap paraphrase. Both Karpathy quotes moved to the prereq post.
