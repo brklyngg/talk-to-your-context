@@ -74,6 +74,14 @@ header {
 .bubble.assistant { align-self: flex-start; background: var(--panel); border: 1px solid var(--line); }
 .bubble.tool      { align-self: center; background: transparent; color: var(--thinking); font-size: 12px; font-style: italic; opacity: 0.9; }
 .bubble.system    { align-self: center; background: transparent; color: var(--muted); font-size: 12px; }
+.bubble-meta {
+  font-size: 0.72em;
+  color: var(--muted);
+  opacity: 0.75;
+  margin-bottom: 3px;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+}
 
 #text-mode {
   border-top: 1px solid var(--line);

@@ -25,6 +25,34 @@ log = logging.getLogger("ttyc.transcripts")
 TRANSCRIPT_DIR = Path(os.getenv("TRANSCRIPT_DIR", "./transcripts")).expanduser()
 
 
+def _platform_for_role(role: str) -> str:
+    """Derive the originating surface from an entry role.
+
+    Roles already encode platform; this helper centralizes the mapping so
+    consumers don't reimplement the convention.
+    """
+    if role in ("user", "assistant"):
+        return "voice"
+    if role in ("user_text", "assistant_text"):
+        return "text"
+    if role in ("tool_question", "tool_answer"):
+        return "tool"
+    return "system"
+
+
+def _session_platform(entries: List[Dict[str, Any]]) -> str:
+    seen = {_platform_for_role(e.get("role", "")) for e in entries}
+    has_voice = "voice" in seen
+    has_text = "text" in seen
+    if has_voice and has_text:
+        return "mixed"
+    if has_voice:
+        return "voice"
+    if has_text:
+        return "text"
+    return "unknown"
+
+
 def write_transcript(conv_id: str, started_at: float, entries: List[Dict[str, Any]]) -> Path:
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     path = TRANSCRIPT_DIR / f"{conv_id}.json"
@@ -55,7 +83,20 @@ async def ingest_into_agent(
         text = (e.get("text", "") or "").strip()
         if text:
             lines.append(f"{role}: {text}")
+    started_at = entries[0].get("ts") if entries else None
+    ended_at = entries[-1].get("ts") if entries else None
+    duration_s = int(ended_at - started_at) if started_at and ended_at else 0
+    started_iso = (
+        datetime.fromtimestamp(started_at).astimezone().isoformat(timespec="seconds")
+        if started_at
+        else "unknown"
+    )
+    metadata_header = (
+        f"[platform={_session_platform(entries)} conv_id={conv_id} "
+        f"started={started_iso} duration={duration_s}s turns={len(entries)}]"
+    )
     body = (
+        f"{metadata_header}\n"
         "Voice call just ended. Here is the transcript - please save the gist "
         "to memory in your usual brief style; no need to reply at length.\n\n"
         + "\n".join(lines)
@@ -83,6 +124,19 @@ async def ingest_into_agent(
 SLACK_CHUNK_CHARS = 3500
 
 
+def _latency_stats(entries: List[Dict[str, Any]]) -> str:
+    """Return ' - avg Ns - max Ns' if any assistant entries carry latencyMs, else ''."""
+    samples = [
+        e["latencyMs"] for e in entries
+        if isinstance(e.get("latencyMs"), (int, float)) and e["latencyMs"] > 0
+    ]
+    if not samples:
+        return ""
+    avg_s = round(sum(samples) / len(samples) / 1000)
+    max_s = round(max(samples) / 1000)
+    return f" - avg {avg_s}s - max {max_s}s"
+
+
 def _build_headline(started_at: float, ended_at: float, entries: List[Dict[str, Any]]) -> str:
     when = datetime.fromtimestamp(started_at).astimezone().strftime("%Y-%m-%d %H:%M")
     duration_s = max(0, int(ended_at - started_at))
@@ -95,7 +149,10 @@ def _build_headline(started_at: float, ended_at: float, entries: List[Dict[str, 
                 break
     if len(first) > 140:
         first = first[:137] + "..."
-    head = f":telephone_receiver: Voice call - {when} - {duration} - {len(entries)} turns"
+    head = (
+        f":telephone_receiver: Voice call - {when} - {duration} - "
+        f"{len(entries)} turns{_latency_stats(entries)}"
+    )
     if first:
         head += f"\nFirst: “{first}”"
     return head
@@ -132,9 +189,12 @@ async def post_to_slack(
 ) -> None:
     """Post the call as a thread to a private Slack channel.
 
-    Top message: scannable headline. Thread replies: full role-prefixed
-    transcript, chunked on entry boundaries to fit Slack's per-message limit.
-    Fire-and-forget - never raises.
+    Top message: scannable headline (now includes ask_agent latency stats
+    when client transcripts carry latencyMs). Thread replies: full
+    role-prefixed transcript, chunked on entry boundaries. Fire-and-forget.
+
+    Mid-call notifications for slow ask_agent turns are intentionally not
+    sent - they'd be noisy and the end-of-call summary is sufficient.
     """
     if not entries:
         return

@@ -23,8 +23,12 @@ let micMuted = false;
 let audioCtx = null;
 let icebreaker = null;     // {fadeIn, fadeOut}
 let activeToolCalls = 0;
-const clientEntries = [];  // {role, text, ts} for end-of-call upload
+const clientEntries = [];  // {role, text, ts, latencyMs?} for end-of-call upload
 let pendingAssistantBubble = null;
+// Per-turn timing. userDoneTs is set when the user's input is fully transcribed
+// (the user-perceived "I'm done speaking" moment). firstTokenTs is set on the
+// first assistant transcript delta. Both reset between turns.
+const turnTiming = { userDoneTs: null, firstTokenTs: null };
 
 // --------------- UI helpers ---------------
 
@@ -34,17 +38,68 @@ function setStatus(text, cls = "") {
 }
 function setDot(cls) { dotEl.className = "dot " + cls; }
 
-function appendBubble(role, text) {
+// --- timing label helpers (pure) ---
+const pad2 = (n) => String(n).padStart(2, "0");
+function timeMarkerLabel(ts) {
+  const d = new Date(ts);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+function latencyLabel(ms) {
+  if (typeof ms !== "number" || !isFinite(ms) || ms < 0) return "";
+  const seconds = Math.round(Math.max(0, ms) / 100) / 10;
+  return seconds < 10 ? `${seconds.toFixed(1).replace(/\.0$/, "")}s` : `${Math.round(seconds)}s`;
+}
+function composeMetaLabel(meta) {
+  if (!meta || typeof meta.createdAt !== "number") return "";
+  const parts = [timeMarkerLabel(meta.createdAt)];
+  const total = latencyLabel(meta.latencyMs);
+  if (total) parts.push(total);
+  const first = latencyLabel(meta.firstTokenLatencyMs);
+  if (first) parts.push(`first ${first}`);
+  return parts.join(" · ");
+}
+
+function appendBubble(role, text, meta) {
   const div = document.createElement("div");
   div.className = "bubble " + role;
-  div.textContent = text;
+  const metaEl = document.createElement("div");
+  metaEl.className = "bubble-meta";
+  const label = composeMetaLabel(meta);
+  metaEl.textContent = label;
+  if (!label) metaEl.style.display = "none";
+  const textEl = document.createElement("div");
+  textEl.className = "bubble-text";
+  textEl.textContent = text;
+  div.appendChild(metaEl);
+  div.appendChild(textEl);
+  div._textEl = textEl;
+  div._metaEl = metaEl;
+  div._meta = meta ? { ...meta } : {};
   transcriptEl.appendChild(div);
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
   return div;
 }
-function recordEntry(role, text) {
+
+function setBubbleText(div, text) {
+  if (div && div._textEl) div._textEl.textContent = text;
+  else if (div) div.textContent = text;
+}
+
+function updateBubbleMeta(div, patch) {
+  if (!div || !div._metaEl) return;
+  div._meta = { ...(div._meta || {}), ...patch };
+  const label = composeMetaLabel(div._meta);
+  div._metaEl.textContent = label;
+  div._metaEl.style.display = label ? "" : "none";
+}
+
+function recordEntry(role, text, extra) {
   if (!text) return;
-  clientEntries.push({ role, text, ts: Date.now() / 1000 });
+  const entry = { role, text, ts: Date.now() / 1000 };
+  if (extra && typeof extra.latencyMs === "number" && extra.latencyMs > 0) {
+    entry.latencyMs = extra.latencyMs;
+  }
+  clientEntries.push(entry);
 }
 
 // --------------- Brown-noise icebreaker idle ---------------
@@ -194,16 +249,31 @@ function onDcMessage(ev) {
 
     case "response.audio_transcript.delta":
       assistantTextBuf += msg.delta || "";
-      if (!pendingAssistantBubble) pendingAssistantBubble = appendBubble("assistant", "");
-      pendingAssistantBubble.textContent = assistantTextBuf;
+      if (!pendingAssistantBubble) {
+        const startedAt = Date.now();
+        if (turnTiming.firstTokenTs === null) turnTiming.firstTokenTs = startedAt;
+        pendingAssistantBubble = appendBubble("assistant", "", { createdAt: startedAt });
+      }
+      setBubbleText(pendingAssistantBubble, assistantTextBuf);
       transcriptEl.scrollTop = transcriptEl.scrollHeight;
       break;
 
-    case "response.audio_transcript.done":
-      if (assistantTextBuf) { recordEntry("assistant", assistantTextBuf); }
+    case "response.audio_transcript.done": {
+      const completedAt = Date.now();
+      const userDoneTs = turnTiming.userDoneTs;
+      const firstTokenTs = turnTiming.firstTokenTs;
+      const latencyMs = userDoneTs ? completedAt - userDoneTs : undefined;
+      const firstTokenLatencyMs = userDoneTs && firstTokenTs ? firstTokenTs - userDoneTs : undefined;
+      if (pendingAssistantBubble) {
+        updateBubbleMeta(pendingAssistantBubble, { latencyMs, firstTokenLatencyMs });
+      }
+      if (assistantTextBuf) { recordEntry("assistant", assistantTextBuf, { latencyMs }); }
       assistantTextBuf = "";
       pendingAssistantBubble = null;
+      turnTiming.userDoneTs = null;
+      turnTiming.firstTokenTs = null;
       break;
+    }
 
     case "conversation.item.input_audio_transcription.delta":
       userTranscriptBuf += msg.delta || "";
@@ -213,7 +283,10 @@ function onDcMessage(ev) {
       const text = (msg.transcript || userTranscriptBuf || "").trim();
       userTranscriptBuf = "";
       if (text) {
-        appendBubble("user", text);
+        const userDoneTs = Date.now();
+        turnTiming.userDoneTs = userDoneTs;
+        turnTiming.firstTokenTs = null;
+        appendBubble("user", text, { createdAt: userDoneTs });
         recordEntry("user", text);
       }
       break;
@@ -373,6 +446,8 @@ function cleanupCall() {
   talkBtn.disabled = false;
   setDot("ok");
   clientEntries.length = 0;
+  turnTiming.userDoneTs = null;
+  turnTiming.firstTokenTs = null;
 }
 
 // Text mode
@@ -396,7 +471,8 @@ textForm.addEventListener("submit", async (ev) => {
     }
   }
   textInput.value = "";
-  appendBubble("user", text);
+  const submitTs = Date.now();
+  appendBubble("user", text, { createdAt: submitTs });
   recordEntry("user_text", text);
   setStatus("agent is thinking...", "thinking");
   setDot("thinking");
@@ -407,8 +483,10 @@ textForm.addEventListener("submit", async (ev) => {
       body: JSON.stringify({ conv_id: convId, text }),
     });
     const d = await r.json();
-    appendBubble("assistant", d.answer || "(no answer)");
-    recordEntry("assistant_text", d.answer || "");
+    const doneTs = Date.now();
+    const latencyMs = doneTs - submitTs;
+    appendBubble("assistant", d.answer || "(no answer)", { createdAt: doneTs, latencyMs });
+    recordEntry("assistant_text", d.answer || "", { latencyMs });
   } catch (e) {
     appendBubble("system", `Error: ${e.message}`);
   } finally {
