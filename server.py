@@ -654,6 +654,24 @@ async def end_call(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "transcript": str(path)})
 
 
+async def client_event(request: web.Request) -> web.Response:
+    """Sink for browser-side telemetry. Writes to the per-call NDJSON via the
+    same log_call_event used by server-side events, so one timeline per call.
+    Fire-and-forget from the client; never blocks audio/tool flow.
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return web.Response(status=204)
+    conv_id = (body.get("conv_id") or "unknown").strip() or "unknown"
+    event = (body.get("event") or "client_unknown").strip() or "client_unknown"
+    payload = {k: v for k, v in body.items() if k not in ("conv_id", "event")}
+    if conv_id != "unknown" and conv_id not in CONVERSATIONS:
+        payload["conv_status"] = "unknown_conv"
+    log_call_event(LOG_DIR, conv_id, event, **payload)
+    return web.Response(status=204)
+
+
 # ---- session reaper --------------------------------------------------------
 # Backgrounding is now a pause, not an end. The reaper guards against the
 # truly-forgotten case: 20 min with zero activity (no /api/session,
@@ -734,6 +752,7 @@ def make_app() -> web.Application:
     app.router.add_get("/api/health", health)
     app.router.add_post("/api/session", session_mint)
     app.router.add_post("/api/ask-agent", ask_agent)
+    app.router.add_post("/api/client-event", client_event)
     app.router.add_get("/api/agent-task/{task_id}", agent_task)
     app.router.add_post("/api/text-turn", text_turn)
     app.router.add_post("/api/resume", resume_call)

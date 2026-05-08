@@ -37,6 +37,23 @@ let watchdogTimer = null;
 // Tasks delivered to the realtime peer; dedupe stale long-polls vs resume payloads.
 const deliveredTaskIds = new Set();
 
+// Last minted/resumed session config; echoed via session.update on dc-open so
+// the model definitively sees instructions+tools (ephemeral-mint config alone
+// is silently dropped by gpt-realtime in some flows).
+let lastSessionConfig = null;
+// Whether the current realtime response window contained a function_call.
+// Reset on response.done so client_response_done can report it accurately.
+let hadFunctionCallThisResponse = false;
+
+function logClientEvent(event, payload = {}) {
+  if (!convId) return;
+  fetch("/api/client-event", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ conv_id: convId, event, ...payload }),
+  }).catch(() => {});
+}
+
 // --------------- UI helpers ---------------
 
 function setStatus(text, cls = "") {
@@ -196,6 +213,7 @@ async function startCall() {
     return;
   }
   convId = session.conv_id;
+  lastSessionConfig = session.session || null;
   try {
     await attachPeer(session, null);
   } catch (e) {
@@ -219,6 +237,36 @@ async function startCall() {
 }
 
 function onDcOpen(resumeContext) {
+  // Re-assert session config over the data channel. Tools registered only at
+  // ephemeral-mint time are silently dropped by gpt-realtime in some flows
+  // (documented community pattern); session.update on dc-open is the canonical
+  // fix. NOTE: omit `voice` -- it is locked after first audio response and
+  // including it on resume tears the session down.
+  const cfg = lastSessionConfig || {};
+  if (cfg.tools || cfg.instructions) {
+    send({
+      type: "session.update",
+      session: {
+        modalities: cfg.modalities || ["audio", "text"],
+        instructions: cfg.instructions,
+        tools: cfg.tools || [],
+        tool_choice: cfg.tool_choice || "auto",
+        turn_detection: cfg.turn_detection,
+        input_audio_format: cfg.input_audio_format,
+        output_audio_format: cfg.output_audio_format,
+        input_audio_transcription: cfg.input_audio_transcription,
+        max_response_output_tokens: cfg.max_response_output_tokens,
+      },
+    });
+  }
+  logClientEvent("client_dc_opened", {
+    tools_in_session: (cfg.tools || []).map((t) => t.name),
+    tool_choice: cfg.tool_choice || null,
+    instructions_chars: (cfg.instructions || "").length,
+    resume: !!resumeContext,
+    session_update_sent: !!(cfg.tools || cfg.instructions),
+  });
+
   if (!resumeContext) {
     send({
       type: "response.create",
@@ -336,6 +384,7 @@ async function triggerResume(reason) {
       cleanupCall();
       return;
     }
+    lastSessionConfig = data.session || null;
     await attachPeer(data, data);
     setStatus("connected", "live");
   } catch (e) {
@@ -410,6 +459,8 @@ function onDcMessage(ev) {
       const item = msg.item || {};
       if (item.type === "function_call") {
         fnCallBuffers.set(item.call_id, { name: item.name, args: "" });
+        hadFunctionCallThisResponse = true;
+        logClientEvent("client_function_call_arrived", { name: item.name, call_id: item.call_id });
         if (item.name === "ask_agent") {
           activeToolCalls++;
           appendBubble("tool", "thinking...");
@@ -441,11 +492,18 @@ function onDcMessage(ev) {
     }
 
     case "response.done":
+      logClientEvent("client_response_done", {
+        had_function_call: hadFunctionCallThisResponse,
+        response_id: msg.response?.id || null,
+        output_item_count: Array.isArray(msg.response?.output) ? msg.response.output.length : null,
+      });
+      hadFunctionCallThisResponse = false;
       break;
 
     case "error":
       console.error("realtime error:", msg);
       setStatus("realtime error", "error");
+      logClientEvent("client_realtime_error", { error: msg.error || msg });
       break;
   }
 }
