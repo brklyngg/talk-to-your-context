@@ -241,23 +241,31 @@ function onDcOpen(resumeContext) {
   // ephemeral-mint time are silently dropped by gpt-realtime in some flows
   // (documented community pattern); session.update on dc-open is the canonical
   // fix. NOTE: omit `voice` -- it is locked after first audio response and
-  // including it on resume tears the session down.
+  // including it on resume tears the session down. Strip nulls (the mint
+  // endpoint accepts null fields like input_audio_transcription.language but
+  // session.update rejects them as invalid_type).
   const cfg = lastSessionConfig || {};
   if (cfg.tools || cfg.instructions) {
-    send({
-      type: "session.update",
-      session: {
-        modalities: cfg.modalities || ["audio", "text"],
-        instructions: cfg.instructions,
-        tools: cfg.tools || [],
-        tool_choice: cfg.tool_choice || "auto",
-        turn_detection: cfg.turn_detection,
-        input_audio_format: cfg.input_audio_format,
-        output_audio_format: cfg.output_audio_format,
-        input_audio_transcription: cfg.input_audio_transcription,
-        max_response_output_tokens: cfg.max_response_output_tokens,
-      },
-    });
+    const stripNulls = (obj) => {
+      if (!obj || typeof obj !== "object") return obj;
+      const out = {};
+      for (const [k, v] of Object.entries(obj)) {
+        if (v !== null && v !== undefined) out[k] = v;
+      }
+      return out;
+    };
+    const sessionPatch = {
+      modalities: cfg.modalities || ["audio", "text"],
+      instructions: cfg.instructions,
+      tools: cfg.tools || [],
+      tool_choice: cfg.tool_choice || "auto",
+      turn_detection: cfg.turn_detection,
+      input_audio_format: cfg.input_audio_format,
+      output_audio_format: cfg.output_audio_format,
+      input_audio_transcription: stripNulls(cfg.input_audio_transcription),
+      max_response_output_tokens: cfg.max_response_output_tokens,
+    };
+    send({ type: "session.update", session: stripNulls(sessionPatch) });
   }
   logClientEvent("client_dc_opened", {
     tools_in_session: (cfg.tools || []).map((t) => t.name),
@@ -364,10 +372,10 @@ function onConnectionStateChange(targetPc) {
   }
 }
 
-async function triggerResume(reason) {
+async function triggerResume(reason, { silent = false } = {}) {
   if (!started || !convId || resumeInFlight) return;
   resumeInFlight = true;
-  setStatus("resuming...", "thinking");
+  if (!silent) setStatus("resuming...", "thinking");
   try {
     // Tear down the dead peer (don't call cleanupCall -- we want to keep
     // started=true and clientEntries intact across the gap).
@@ -500,10 +508,28 @@ function onDcMessage(ev) {
       hadFunctionCallThisResponse = false;
       break;
 
-    case "error":
+    case "error": {
+      const code = msg.error?.code;
+      logClientEvent("client_realtime_error", {
+        code,
+        err_type: msg.error?.type,
+        message: msg.error?.message,
+        event_id: msg.event_id,
+        error: msg.error || msg,
+      });
+      if (code === "session_expired") {
+        // OpenAI hard-capped the session (15/30/60 min depending on rollout).
+        // Rotate silently through the existing resume seam.
+        triggerResume("openai_session_expired", { silent: true });
+        break;
+      }
       console.error("realtime error:", msg);
       setStatus("realtime error", "error");
-      logClientEvent("client_realtime_error", { error: msg.error || msg });
+      break;
+    }
+
+    default:
+      logClientEvent("client_dc_unhandled_event", { type: msg.type });
       break;
   }
 }
