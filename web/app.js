@@ -21,14 +21,21 @@ let convId = null;
 let started = false;
 let micMuted = false;
 let audioCtx = null;
-let icebreaker = null;     // {fadeIn, fadeOut}
+let icebreaker = null;     // {fadeIn, fadeOut} -- kept as no-op shim; gpt-realtime's
+                           // native async tool calling means we no longer need the
+                           // brown-noise rumble during ask_agent.
 let activeToolCalls = 0;
 const clientEntries = [];  // {role, text, ts, latencyMs?} for end-of-call upload
 let pendingAssistantBubble = null;
-// Per-turn timing. userDoneTs is set when the user's input is fully transcribed
-// (the user-perceived "I'm done speaking" moment). firstTokenTs is set on the
-// first assistant transcript delta. Both reset between turns.
 const turnTiming = { userDoneTs: null, firstTokenTs: null };
+
+// Connection-state debounce (5G <-> wifi handover, transient blips)
+let connDownSinceTs = null;
+let resumeInFlight = false;
+let watchdogTimer = null;
+
+// Tasks delivered to the realtime peer; dedupe stale long-polls vs resume payloads.
+const deliveredTaskIds = new Set();
 
 // --------------- UI helpers ---------------
 
@@ -38,7 +45,6 @@ function setStatus(text, cls = "") {
 }
 function setDot(cls) { dotEl.className = "dot " + cls; }
 
-// --- timing label helpers (pure) ---
 const pad2 = (n) => String(n).padStart(2, "0");
 function timeMarkerLabel(ts) {
   const d = new Date(ts);
@@ -102,30 +108,11 @@ function recordEntry(role, text, extra) {
   clientEntries.push(entry);
 }
 
-// --------------- Brown-noise icebreaker idle ---------------
-
-function createIcebreakerIdle(ctx) {
-  const len = ctx.sampleRate * 2;
-  const buf = ctx.createBuffer(1, len, ctx.sampleRate);
-  const ch = buf.getChannelData(0);
-  let last = 0;
-  for (let i = 0; i < len; i++) {
-    const white = Math.random() * 2 - 1;
-    last = (last + 0.02 * white) / 1.02;
-    ch[i] = last * 3.5;
-  }
-  const src = ctx.createBufferSource();
-  src.buffer = buf; src.loop = true;
-  const lp = ctx.createBiquadFilter();
-  lp.type = "lowpass"; lp.frequency.value = 200; lp.Q.value = 0.7;
-  const master = ctx.createGain(); master.gain.value = 0;
-  const lfo = ctx.createOscillator(); lfo.frequency.value = 0.3;
-  const lfoGain = ctx.createGain(); lfoGain.gain.value = 0.05;
-  src.connect(lp).connect(master).connect(ctx.destination);
-  lfo.connect(lfoGain).connect(master.gain);
-  src.start(); lfo.start();
-  const fade = (target, dur = 0.25) => master.gain.linearRampToValueAtTime(target, ctx.currentTime + dur);
-  return { fadeIn: () => fade(0.35), fadeOut: () => fade(0.0) };
+// Render a clearly-broken tool result distinctly. Helps Gary see at a glance
+// that the realtime model would have hallucinated otherwise.
+function isErrorAnswer(answer) {
+  if (!answer) return true;
+  return typeof answer === "string" && answer.startsWith("Agent is temporarily unreachable");
 }
 
 // --------------- Health ---------------
@@ -144,7 +131,45 @@ async function checkHealth() {
   }
 }
 
-// --------------- Realtime session ---------------
+// --------------- Realtime peer (extracted so resume can rebuild it) ---------------
+
+async function attachPeer(session, resumeContext) {
+  const ephemeral = session.session.client_secret.value;
+  const model = session.session.model || "gpt-realtime";
+
+  const newPc = new RTCPeerConnection();
+  newPc.onconnectionstatechange = () => onConnectionStateChange(newPc);
+  newPc.oniceconnectionstatechange = () => {
+    // Surface a status hint but treat connectionState as authoritative.
+    const s = newPc.iceConnectionState;
+    if (s === "failed") setStatus("connection lost", "error");
+  };
+  const audioEl = document.createElement("audio");
+  audioEl.autoplay = true;
+  audioEl.playsInline = true;
+  newPc.ontrack = (ev) => { audioEl.srcObject = ev.streams[0]; };
+  micStream.getTracks().forEach((t) => newPc.addTrack(t, micStream));
+  const newDc = newPc.createDataChannel("oai-events");
+  newDc.addEventListener("open", () => onDcOpen(resumeContext));
+  newDc.addEventListener("message", onDcMessage);
+
+  setStatus(resumeContext ? "resuming..." : "connecting...");
+  const offer = await newPc.createOffer();
+  await newPc.setLocalDescription(offer);
+  const sdpResp = await fetch(`https://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${ephemeral}`, "Content-Type": "application/sdp", "OpenAI-Beta": "realtime=v1" },
+    body: offer.sdp,
+  });
+  if (!sdpResp.ok) throw new Error(`sdp ${sdpResp.status}: ${await sdpResp.text()}`);
+  const answerSdp = await sdpResp.text();
+  await newPc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+
+  // Swap globals only after success.
+  pc = newPc;
+  dc = newDc;
+  startConnectionWatchdog();
+}
 
 async function startCall() {
   if (started) return;
@@ -171,39 +196,8 @@ async function startCall() {
     return;
   }
   convId = session.conv_id;
-  const ephemeral = session.session.client_secret.value;
-  const model = session.session.model || "gpt-realtime";
-
-  // WebRTC
-  pc = new RTCPeerConnection();
-  pc.oniceconnectionstatechange = () => {
-    const s = pc.iceConnectionState;
-    if (s === "failed" || s === "disconnected") setStatus("connection lost", "error");
-  };
-  // Inbound audio -> <audio>
-  const audioEl = document.createElement("audio");
-  audioEl.autoplay = true;
-  audioEl.playsInline = true;
-  pc.ontrack = (ev) => { audioEl.srcObject = ev.streams[0]; };
-  // Outbound mic
-  micStream.getTracks().forEach((t) => pc.addTrack(t, micStream));
-  // Data channel
-  dc = pc.createDataChannel("oai-events");
-  dc.addEventListener("open", onDcOpen);
-  dc.addEventListener("message", onDcMessage);
-
-  setStatus("connecting...");
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  let answerSdp;
   try {
-    const sdpResp = await fetch(`https://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${ephemeral}`, "Content-Type": "application/sdp", "OpenAI-Beta": "realtime=v1" },
-      body: offer.sdp,
-    });
-    if (!sdpResp.ok) throw new Error(`sdp ${sdpResp.status}: ${await sdpResp.text()}`);
-    answerSdp = await sdpResp.text();
+    await attachPeer(session, null);
   } catch (e) {
     setStatus("connect failed", "error");
     appendBubble("system", `WebRTC connect failed: ${e.message}`);
@@ -211,11 +205,11 @@ async function startCall() {
     talkBtn.disabled = false;
     return;
   }
-  await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
 
-  // Audio context for icebreaker idle (must be created post-user-gesture; talkBtn click qualifies)
+  // AudioContext kept around for future UI cues (e.g., subtle haptic-like tone).
+  // Brown-noise icebreaker is intentionally NOT started: gpt-realtime now handles
+  // async tool calls natively and can converse during the wait.
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  icebreaker = createIcebreakerIdle(audioCtx);
 
   started = true;
   endBtn.hidden = false;
@@ -224,12 +218,132 @@ async function startCall() {
   setStatus("connected", "live");
 }
 
-function onDcOpen() {
-  // Have the model greet first.
+function onDcOpen(resumeContext) {
+  if (!resumeContext) {
+    send({
+      type: "response.create",
+      response: { modalities: ["audio", "text"], instructions: "Greet the user briefly. Just one sentence." },
+    });
+    return;
+  }
+  // Resume path: replay any answers the user missed as a normal user/assistant
+  // pair (NOT function_call_output -- the call_id belonged to the dead session
+  // and Realtime would reject it). Then ask the model to greet + walk through.
+  const completed = resumeContext.completed_while_away || [];
+  for (const item of completed) {
+    if (deliveredTaskIds.has(item.task_id)) continue;
+    deliveredTaskIds.add(item.task_id);
+    send({
+      type: "conversation.item.create",
+      item: { type: "message", role: "user", content: [{ type: "input_text", text: `(replayed from before the pause) ${item.question}` }] },
+    });
+    send({
+      type: "conversation.item.create",
+      item: { type: "message", role: "assistant", content: [{ type: "text", text: item.answer }] },
+    });
+    appendBubble("tool", `↻ carried over: ${item.question}`);
+    appendBubble("tool", `← ${item.answer}`);
+  }
+  let primer;
+  if (completed.length > 0) {
+    primer = "User just got back from a brief pause. The agent finished work while they were away. Greet them in one short sentence and offer to walk through the answer(s).";
+  } else {
+    primer = "User just got back from a brief pause. Greet them in one short sentence and continue naturally.";
+  }
   send({
-    type: "response.create",
-    response: { modalities: ["audio", "text"], instructions: "Greet the user briefly. Just one sentence." },
+    type: "conversation.item.create",
+    item: { type: "message", role: "system", content: [{ type: "input_text", text: primer }] },
   });
+  send({ type: "response.create" });
+
+  // Reattach long-polls for tasks that are still running on the server.
+  const stillWorking = resumeContext.still_working || [];
+  for (const t of stillWorking) {
+    if (deliveredTaskIds.has(t.task_id)) continue;
+    appendBubble("tool", `🧠 still working on: ${t.question} (${t.elapsed_s}s)`);
+    pollAgentTask(null, t.task_id, t.question);
+  }
+
+  appendBubble("system", `↻ Resumed${completed.length ? ` · ${completed.length} answer(s) ready` : ""}${stillWorking.length ? ` · ${stillWorking.length} still working` : ""}`);
+}
+
+// --------------- Connection monitoring (5G <-> wifi, backgrounding) ---------------
+
+function startConnectionWatchdog() {
+  if (watchdogTimer) clearInterval(watchdogTimer);
+  let lastInbound = null;
+  let lastInboundChangeTs = Date.now();
+  watchdogTimer = setInterval(async () => {
+    if (!pc || pc.connectionState !== "connected") return;
+    try {
+      const stats = await pc.getStats();
+      let inbound = 0;
+      stats.forEach((s) => {
+        if (s.type === "inbound-rtp" && s.kind === "audio") inbound += s.bytesReceived || 0;
+      });
+      if (lastInbound === null) { lastInbound = inbound; return; }
+      if (inbound !== lastInbound) {
+        lastInbound = inbound;
+        lastInboundChangeTs = Date.now();
+      } else if (Date.now() - lastInboundChangeTs > 12_000) {
+        // 12 s with state="connected" but no new inbound bytes => silent freeze.
+        console.warn("watchdog: silent freeze, triggering resume");
+        lastInboundChangeTs = Date.now();
+        triggerResume("silent_freeze");
+      }
+    } catch {}
+  }, 5_000);
+}
+
+function onConnectionStateChange(targetPc) {
+  if (targetPc !== pc) return; // stale callback from a torn-down peer
+  const s = pc.connectionState;
+  if (s === "connected") {
+    connDownSinceTs = null;
+    setStatus("connected", "live");
+    return;
+  }
+  if (s === "failed" || s === "disconnected") {
+    if (connDownSinceTs === null) connDownSinceTs = Date.now();
+    setStatus("link unstable", "error");
+    setTimeout(() => {
+      if (!pc || pc !== targetPc) return;
+      const stillBad = pc.connectionState === "failed" || pc.connectionState === "disconnected";
+      if (stillBad && connDownSinceTs && Date.now() - connDownSinceTs >= 3_000) {
+        triggerResume("peer_" + pc.connectionState);
+      }
+    }, 3_200);
+  }
+}
+
+async function triggerResume(reason) {
+  if (!started || !convId || resumeInFlight) return;
+  resumeInFlight = true;
+  setStatus("resuming...", "thinking");
+  try {
+    // Tear down the dead peer (don't call cleanupCall -- we want to keep
+    // started=true and clientEntries intact across the gap).
+    if (dc) { try { dc.close(); } catch {} dc = null; }
+    if (pc) { try { pc.close(); } catch {} pc = null; }
+    const r = await fetch("/api/resume", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conv_id: convId }),
+    });
+    const data = await r.json();
+    if (data.expired) {
+      appendBubble("system", "Session expired while away. Tap Talk to start a new one.");
+      cleanupCall();
+      return;
+    }
+    await attachPeer(data, data);
+    setStatus("connected", "live");
+  } catch (e) {
+    appendBubble("system", `Resume failed: ${e.message}. Tap Talk to retry.`);
+    cleanupCall();
+  } finally {
+    resumeInFlight = false;
+  }
 }
 
 // --------------- Data channel events ---------------
@@ -298,7 +412,6 @@ function onDcMessage(ev) {
         fnCallBuffers.set(item.call_id, { name: item.name, args: "" });
         if (item.name === "ask_agent") {
           activeToolCalls++;
-          if (icebreaker) icebreaker.fadeIn();
           appendBubble("tool", "thinking...");
           setStatus("agent is thinking...", "thinking");
           setDot("thinking");
@@ -322,14 +435,12 @@ function onDcMessage(ev) {
       if (name === "ask_agent") {
         handleAskAgent(msg.call_id, args.question || "");
       } else {
-        // Unknown tool - return an error so the model can recover
         sendFunctionOutput(msg.call_id, JSON.stringify({ error: `unknown tool ${name}` }));
       }
       break;
     }
 
     case "response.done":
-      // turn finished
       break;
 
     case "error":
@@ -347,30 +458,77 @@ function sendFunctionOutput(call_id, output) {
   send({ type: "response.create" });
 }
 
+// Spawn an agent task on the server and long-poll until done. Survives
+// backgrounding -- if the browser tab dies, the task keeps running on the
+// server and the answer is replayed via /api/resume's `completed_while_away`.
 async function handleAskAgent(callId, question) {
+  let taskId = null;
   let answer = "";
+  appendBubble("tool", `→ ${question}`);
   try {
-    const r = await fetch("/api/ask-agent", {
+    const spawn = await fetch("/api/ask-agent", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ conv_id: convId, question }),
+      body: JSON.stringify({ conv_id: convId, question, call_id: callId }),
     });
-    const data = await r.json();
-    answer = data.answer || "(no answer)";
+    const spawnData = await spawn.json();
+    taskId = spawnData.task_id || null;
+    if (spawnData.status && spawnData.status !== "running") {
+      // Inline fast-path -- answer is already here.
+      answer = spawnData.answer || "";
+    } else if (taskId) {
+      answer = await pollAgentTask(callId, taskId, question);
+    } else {
+      answer = spawnData.answer || "(no answer)";
+    }
   } catch (e) {
-    answer = `(error reaching agent: ${e.message})`;
+    answer = `Agent is temporarily unreachable - ${e.message}`;
   } finally {
     activeToolCalls = Math.max(0, activeToolCalls - 1);
     if (activeToolCalls === 0) {
-      if (icebreaker) icebreaker.fadeOut();
       setStatus("connected", "live");
       setDot("ok");
     }
   }
-  // Show in transcript and feed back to model
-  appendBubble("tool", `-> ${question}`);
-  appendBubble("tool", `<- ${answer}`);
-  sendFunctionOutput(callId, answer);
+  if (taskId) deliveredTaskIds.add(taskId);
+  // Render answer; flag failures distinctly so Gary can tell at a glance.
+  appendBubble(isErrorAnswer(answer) ? "system" : "tool", `← ${answer || "(no answer)"}`);
+  // Always feed something back to the realtime peer so it doesn't hang on the
+  // function call. Structured-error sentinel triggers prompt rule #10.
+  sendFunctionOutput(callId, answer || "Agent is temporarily unreachable - please ask the user to repeat that.");
+}
+
+// Poll loop reused by handleAskAgent and resume's still_working reattach.
+// callId may be null on resume -- we still update the transcript/UI even when
+// there's no live realtime peer to feed.
+async function pollAgentTask(callId, taskId, question) {
+  while (true) {
+    if (!convId) return "";
+    let data;
+    try {
+      const r = await fetch(`/api/agent-task/${encodeURIComponent(taskId)}?conv_id=${encodeURIComponent(convId)}`);
+      data = await r.json();
+    } catch (e) {
+      // Network blip during long-poll. Brief retry; resume flow handles real failures.
+      await new Promise((res) => setTimeout(res, 1500));
+      continue;
+    }
+    if (data.status === "running") continue;
+    deliveredTaskIds.add(taskId);
+    const answer = data.answer || "";
+    if (callId === null) {
+      // Resume-attached poll: render in transcript and feed to whichever peer
+      // is currently live (if any) as a normal assistant message.
+      appendBubble("tool", `→ (carried over) ${question}`);
+      appendBubble(isErrorAnswer(answer) ? "system" : "tool", `← ${answer || "(no answer)"}`);
+      send({
+        type: "conversation.item.create",
+        item: { type: "message", role: "assistant", content: [{ type: "text", text: answer }] },
+      });
+      send({ type: "response.create" });
+    }
+    return answer;
+  }
 }
 
 // --------------- Mute / End / Text mode ---------------
@@ -384,8 +542,6 @@ muteBtn.addEventListener("click", () => {
 
 endBtn.addEventListener("click", endCall);
 
-// Fire-and-forget end-call. Safe to call repeatedly (server is idempotent);
-// safe to call from page-unload paths because keepalive:true survives teardown.
 function endCallBeacon(reason) {
   if (!convId) return;
   const cid = convId;
@@ -419,13 +575,17 @@ async function endCall() {
   }
 }
 
-// Mobile-safe lifecycle cleanup. iOS Safari frequently kills backgrounded
-// tabs without firing pagehide - visibilitychange->hidden is the durable
-// signal. pagehide is the desktop / proper-close backup. Server /api/end
-// is idempotent so duplicate fires are harmless.
+// Backgrounding is now a PAUSE, not an end. We only post /api/end on a real
+// teardown (pagehide) or the explicit End button. visibilitychange just marks
+// the timeline and triggers a resume on return.
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden" && started) {
-    endCallBeacon("visibilitychange");
+  if (!started) return;
+  if (document.visibilityState === "hidden") {
+    clientEntries.push({ role: "system", text: "(paused -- app backgrounded)", ts: Date.now() / 1000 });
+  } else if (document.visibilityState === "visible") {
+    if (!pc || pc.connectionState !== "connected") {
+      triggerResume("visibility_visible");
+    }
   }
 });
 window.addEventListener("pagehide", () => {
@@ -438,7 +598,7 @@ function cleanupCall() {
   muteBtn.disabled = true;
   micMuted = false;
   muteBtn.textContent = "\u{1F507}";
-  if (icebreaker) { icebreaker.fadeOut(); icebreaker = null; }
+  if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
   if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
   if (dc) { try { dc.close(); } catch {} dc = null; }
   if (pc) { try { pc.close(); } catch {} pc = null; }
@@ -446,8 +606,12 @@ function cleanupCall() {
   talkBtn.disabled = false;
   setDot("ok");
   clientEntries.length = 0;
+  deliveredTaskIds.clear();
   turnTiming.userDoneTs = null;
   turnTiming.firstTokenTs = null;
+  connDownSinceTs = null;
+  resumeInFlight = false;
+  convId = null;
 }
 
 // Text mode
@@ -459,7 +623,6 @@ textForm.addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const text = textInput.value.trim();
   if (!text) return;
-  // Need an active conv_id - if no call is live, mint a session for text-only
   if (!convId) {
     try {
       const r = await fetch("/api/session", { method: "POST" });
@@ -485,7 +648,8 @@ textForm.addEventListener("submit", async (ev) => {
     const d = await r.json();
     const doneTs = Date.now();
     const latencyMs = doneTs - submitTs;
-    appendBubble("assistant", d.answer || "(no answer)", { createdAt: doneTs, latencyMs });
+    const ans = d.answer || "(no answer)";
+    appendBubble(isErrorAnswer(ans) ? "system" : "assistant", ans, { createdAt: doneTs, latencyMs });
     recordEntry("assistant_text", d.answer || "", { latencyMs });
   } catch (e) {
     appendBubble("system", `Error: ${e.message}`);

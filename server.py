@@ -32,6 +32,7 @@ HERE = Path(__file__).parent
 load_dotenv(HERE / ".env")
 
 from auth import tailnet_middleware  # noqa: E402
+from events import log_call_event  # noqa: E402
 from transcripts import write_transcript, ingest_into_agent, post_to_slack  # noqa: E402
 
 LOG_DIR = HERE / "logs"
@@ -69,8 +70,44 @@ if not AGENT_API_KEY:
 if not OPENAI_API_KEY:
     log.warning("OPENAI_API_KEY not in env - /api/session will 500")
 
-# Active conversations: conv_id -> {started_at: float, entries: [...]}
+# Active conversations: conv_id -> {
+#   started_at: float, last_activity_ts: float,
+#   entries: [...],
+#   agent_tasks: {task_id: {question, status, answer, started_at,
+#                           finished_at, realtime_call_id,
+#                           delivered_to_realtime: bool, task: asyncio.Task}}
+# }
 CONVERSATIONS: Dict[str, Dict[str, Any]] = {}
+
+# How long /api/agent-task long-polls before returning (client retries).
+# Bounded below the typical mobile-network/CDN idle timeout.
+AGENT_TASK_LONG_POLL_SEC = 25.0
+# Inline fast-path: if the agent answers within this many seconds, return it
+# in the /api/ask-agent response so the browser never has to long-poll.
+ASK_AGENT_FAST_PATH_SEC = 1.5
+# Cap concurrent in-flight agent tasks per conversation. Realtime model can
+# parallel-call -- bound it so a misbehaving session can't flood.
+MAX_CONCURRENT_AGENT_TASKS = 3
+# Idle-reap window. Backgrounding no longer ends a call, so we use this as
+# the cost guard instead of the prior 65-min started_at ceiling.
+REAPER_INTERVAL_SEC = 60
+REAPER_IDLE_TIMEOUT_SEC = 20 * 60
+
+
+def _new_task_id() -> str:
+    return secrets.token_urlsafe(9)
+
+
+def _touch(conv: Dict[str, Any]) -> None:
+    conv["last_activity_ts"] = time.time()
+
+
+def _ensure_conv_shape(conv: Dict[str, Any]) -> None:
+    """Backfill optional keys so existing in-memory conversations from older
+    server versions don't KeyError after a code update."""
+    conv.setdefault("entries", [])
+    conv.setdefault("agent_tasks", {})
+    conv.setdefault("last_activity_ts", conv.get("started_at", time.time()))
 
 ASK_AGENT_TOOL_SCHEMA = {
     "type": "function",
@@ -95,10 +132,17 @@ ASK_AGENT_TOOL_SCHEMA = {
     },
 }
 
-# Customize this for your agent. The default below is intentionally generic;
-# it tells the realtime model how to behave on a phone-call-tempo voice line
-# and when to delegate to ask_agent vs. handle small talk itself.
-VOICE_SYSTEM_PROMPT = """\
+# Optional deployment-specific facts the realtime model can rely on without
+# guessing. Inject things like "your filesystem-write tools are real" or
+# "your logs live at <path>" so the model stops hallucinating refusals about
+# its own capabilities. Leave empty for the generic public scaffold.
+AGENT_DEPLOYMENT_NOTE = os.getenv("AGENT_DEPLOYMENT_NOTE", "").strip()
+
+# Customize this for your agent. Rules 5-9 are quality scaffolding kept from
+# the prior revision. Rule 2 changed in May 2026: gpt-realtime now handles
+# asynchronous function calls natively, so the prior "stay silent" rule was
+# actively suppressing a paid-for capability.
+_BASE_PROMPT = """\
 You are a live voice assistant. Your voice is the OpenAI realtime model.
 Your *brain* is consulted via the ask_agent tool, which routes to a backend
 agent loop with full memory, skills, and external integrations.
@@ -106,9 +150,9 @@ agent loop with full memory, skills, and external integrations.
 CRITICAL TOOL-CALL RULES:
 1. For ANY substantive question - calendar, email, memory, projects, drafting,
    research, anything beyond pure small talk - call ask_agent.
-2. When you call ask_agent, DO NOT speak. No bridging phrases like "let me
-   check" or "one moment" or "okay". Stay completely silent. The user will
-   hear a low ambient hum during the tool call (a brown-noise icebreaker idle).
+2. During an ask_agent call you may say one short bridging line ("one sec",
+   "looking now") if the wait is going long, but never invent the answer
+   while waiting. Short interjections are fine; running narration is not.
 3. After the tool result arrives, speak the answer naturally and briefly.
    Phone-call tempo: <=2 sentences per turn unless asked for more. Numbers
    spoken naturally ("ten thirty", not "10:30 colon zero zero"). No markdown.
@@ -135,10 +179,25 @@ STYLE RULES:
 9. Lead with the answer - the number, the time, the yes/no, the decision.
    Reasons after, only if asked or load-bearing.
 
+TOOL-FAILURE HONESTY:
+10. If ask_agent's answer starts with "Agent is temporarily unreachable" or
+    is empty, say so plainly and ask the user to repeat. Never invent.
+
+CAPABILITIES (TRUTH - DO NOT CONTRADICT):
+- Questions about your model, voice, logs, file capabilities, or where data
+  lives must be answered via ask_agent. The agent knows its own setup; you
+  do not. Do not improvise refusals like "I don't have access to that".
+"""
+
+VOICE_SYSTEM_PROMPT = (
+    _BASE_PROMPT
+    + (("\nDEPLOYMENT NOTE:\n" + AGENT_DEPLOYMENT_NOTE + "\n") if AGENT_DEPLOYMENT_NOTE else "")
+    + """
 PERSONA:
 Warm, dry-witted, and concise. Sound like a sharp colleague who doesn't waste
 time. Avoid corporate hedging. Don't say "I can help you with that" - just help.
 """
+)
 
 
 # ---- helpers ---------------------------------------------------------------
@@ -221,17 +280,17 @@ async def health(request: web.Request) -> web.Response:
     return web.json_response({
         "ok": True,
         "agent": agent_ok,
+        # Back-compat for older Hermes-named PWA clients still cached on
+        # devices. The pre-rename app.js looks for `hermes` here.
+        "hermes": agent_ok,
         "model": OPENAI_REALTIME_MODEL,
         "voice": OPENAI_REALTIME_VOICE,
         "openai_key": bool(OPENAI_API_KEY),
     })
 
 
-async def session_mint(request: web.Request) -> web.Response:
-    if not OPENAI_API_KEY:
-        return web.json_response({"error": "no_openai_key"}, status=500)
-    conv_id = _new_conv_id()
-    CONVERSATIONS[conv_id] = {"started_at": time.time(), "entries": []}
+async def _mint_realtime_session() -> dict:
+    """Mint an OpenAI Realtime ephemeral session. Raises on HTTP/network error."""
     body = {
         "model": OPENAI_REALTIME_MODEL,
         "voice": OPENAI_REALTIME_VOICE,
@@ -243,52 +302,213 @@ async def session_mint(request: web.Request) -> web.Response:
         "input_audio_format": "pcm16",
         "output_audio_format": "pcm16",
         "input_audio_transcription": {"model": "whisper-1"},
-        # Per-response output ceiling. Session-level acts as default for every
-        # response.create unless overridden. ~1500 tokens ~= 30s of speech.
         "max_response_output_tokens": 1500,
     }
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            "https://api.openai.com/v1/realtime/sessions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+                "OpenAI-Beta": "realtime=v1",
+            },
+            json=body,
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+async def session_mint(request: web.Request) -> web.Response:
+    if not OPENAI_API_KEY:
+        return web.json_response({"error": "no_openai_key"}, status=500)
+    conv_id = _new_conv_id()
+    now = time.time()
+    CONVERSATIONS[conv_id] = {
+        "started_at": now,
+        "last_activity_ts": now,
+        "entries": [],
+        "agent_tasks": {},
+    }
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(
-                "https://api.openai.com/v1/realtime/sessions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                    "OpenAI-Beta": "realtime=v1",
-                },
-                json=body,
-            )
-            r.raise_for_status()
-            data = r.json()
+        data = await _mint_realtime_session()
     except httpx.HTTPStatusError as e:
         log.error("ephemeral mint failed: %s %s", e.response.status_code, e.response.text[:300])
         return web.json_response({"error": "ephemeral_mint_failed", "detail": e.response.text[:300]}, status=502)
     except Exception as e:  # noqa: BLE001
         log.exception("ephemeral mint exception")
         return web.json_response({"error": "ephemeral_mint_exception", "detail": str(e)}, status=502)
+    log_call_event(LOG_DIR, conv_id, "session_minted", model=OPENAI_REALTIME_MODEL, voice=OPENAI_REALTIME_VOICE)
     return web.json_response({"conv_id": conv_id, "session": data})
 
 
+_AGENT_UNREACHABLE_SENTINEL = "Agent is temporarily unreachable"
+
+
+def _structured_unreachable(error_type: str) -> dict:
+    """Tool-result envelope the realtime model recognizes as a clean failure.
+
+    System prompt rule #10 keys off the leading sentinel, so the realtime
+    model says "the agent didn't answer, please repeat" instead of inventing
+    a refusal.
+    """
+    return {
+        "answer": f"{_AGENT_UNREACHABLE_SENTINEL} - please ask the user to repeat that.",
+        "_error": error_type,
+    }
+
+
+async def _run_agent_task(conv_id: str, task_id: str) -> None:
+    """Run the agent SSE stream as a server-side task. Survives client disconnect.
+
+    Updates ``conv["agent_tasks"][task_id]`` with status/answer; touches
+    ``last_activity_ts`` on completion so a long deep-context call doesn't
+    get reaped while productive work is happening. Records the transcript
+    pair via the local ``conv`` reference -- safe even if /api/end pops the
+    conv mid-stream (the dict object survives via this function's closure).
+    """
+    conv = CONVERSATIONS.get(conv_id)
+    if conv is None:
+        return
+    task_state = conv["agent_tasks"].get(task_id)
+    if task_state is None:
+        return
+    question = task_state["question"]
+    try:
+        answer = await _agent_chat(conv_id, question)
+        status = "done"
+        error_type = None
+    except asyncio.CancelledError:
+        task_state["status"] = "cancelled"
+        task_state["finished_at"] = time.time()
+        log_call_event(LOG_DIR, conv_id, "ask_agent_cancelled", task_id=task_id)
+        raise
+    except httpx.TimeoutException:
+        answer = _structured_unreachable("timeout")["answer"]
+        status = "error"
+        error_type = "timeout"
+    except Exception as e:  # noqa: BLE001
+        log.exception("agent task failed")
+        answer = _structured_unreachable(type(e).__name__)["answer"]
+        status = "error"
+        error_type = type(e).__name__
+    finished_at = time.time()
+    task_state["answer"] = answer
+    task_state["status"] = status
+    task_state["finished_at"] = finished_at
+    latency_ms = int((finished_at - task_state["started_at"]) * 1000)
+    log_call_event(
+        LOG_DIR, conv_id, "ask_agent_done",
+        task_id=task_id, latency_ms=latency_ms, chars=len(answer),
+        status=status, error_type=error_type,
+    )
+    # Belt-and-suspenders: append to the LOCAL conv ref. Even if /api/end
+    # popped the conv from CONVERSATIONS during the SSE stream, the dict is
+    # still alive via this closure -- no KeyError.
+    conv["entries"].append({"role": "tool_question", "text": question, "ts": task_state["started_at"]})
+    conv["entries"].append({"role": "tool_answer", "text": answer, "ts": finished_at})
+    # Touch activity so deep work doesn't get reaped while it's actually running.
+    conv["last_activity_ts"] = finished_at
+    # If the conv was already popped (rare: user hit End mid-stream), surface
+    # the late turn forensically.
+    if CONVERSATIONS.get(conv_id) is None:
+        log_call_event(LOG_DIR, conv_id, "late_turn", task_id=task_id, chars=len(answer))
+
+
 async def ask_agent(request: web.Request) -> web.Response:
+    """Spawn an agent task; return inline if the fast-path completes in time.
+
+    Otherwise return ``{task_id, status: "running"}`` and let the client
+    long-poll ``/api/agent-task/<task_id>``. The task survives client
+    disconnect (Gary backgrounds the iPhone, the work keeps going).
+    """
     body = await request.json()
     conv_id = body.get("conv_id")
     question = (body.get("question") or "").strip()
-    if not conv_id or conv_id not in CONVERSATIONS:
+    realtime_call_id = body.get("call_id")
+    conv = CONVERSATIONS.get(conv_id) if conv_id else None
+    if conv is None:
         return web.json_response({"error": "unknown_conv_id"}, status=400)
+    _ensure_conv_shape(conv)
     if not question:
         return web.json_response({"answer": "(empty question)"}, status=200)
-    log.info("ask_agent [%s]: %s", conv_id, question[:120])
+
+    in_flight = sum(1 for t in conv["agent_tasks"].values() if t["status"] == "running")
+    if in_flight >= MAX_CONCURRENT_AGENT_TASKS:
+        log_call_event(LOG_DIR, conv_id, "tool_error", error_type="too_many_in_flight", in_flight=in_flight)
+        return web.json_response({**_structured_unreachable("too_many_in_flight"), "task_id": None}, status=200)
+
+    _touch(conv)
+    task_id = _new_task_id()
+    log.info("ask_agent [%s/%s]: %s", conv_id, task_id, question[:120])
+    log_call_event(LOG_DIR, conv_id, "ask_agent_spawned", task_id=task_id, chars=len(question))
+    state = {
+        "task_id": task_id,
+        "question": question,
+        "status": "running",
+        "answer": None,
+        "started_at": time.time(),
+        "finished_at": None,
+        "realtime_call_id": realtime_call_id,
+        "delivered_to_realtime": False,
+        "task": None,
+    }
+    conv["agent_tasks"][task_id] = state
+    coro = _run_agent_task(conv_id, task_id)
+    task = asyncio.create_task(coro)
+    state["task"] = task
+
+    # Fast path: wait briefly for completion so chitchat-grade calls don't
+    # round-trip through /api/agent-task.
     try:
-        answer = await _agent_chat(conv_id, question)
-    except httpx.TimeoutException:
-        answer = "I'm taking longer than expected - try again or rephrase."
-    except Exception as e:  # noqa: BLE001
-        log.exception("ask_agent failed")
-        answer = f"I'm having trouble reaching the agent - {type(e).__name__}. Try again in a moment."
-    # Record both turns into the transcript
-    CONVERSATIONS[conv_id]["entries"].append({"role": "tool_question", "text": question, "ts": time.time()})
-    CONVERSATIONS[conv_id]["entries"].append({"role": "tool_answer", "text": answer, "ts": time.time()})
-    return web.json_response({"answer": answer})
+        await asyncio.wait_for(asyncio.shield(task), timeout=ASK_AGENT_FAST_PATH_SEC)
+    except asyncio.TimeoutError:
+        return web.json_response({"task_id": task_id, "status": "running"})
+    except asyncio.CancelledError:
+        # The task itself was cancelled (e.g., conv ended). Surface as such.
+        return web.json_response({"task_id": task_id, "status": "cancelled", "answer": ""})
+    return web.json_response({
+        "task_id": task_id,
+        "status": state["status"],
+        "answer": state.get("answer") or "",
+    })
+
+
+async def agent_task(request: web.Request) -> web.Response:
+    """Long-poll endpoint for a server-side agent task.
+
+    Returns when status != running, or after AGENT_TASK_LONG_POLL_SEC --
+    whichever comes first. The client retries until status is final.
+    """
+    task_id = request.match_info["task_id"]
+    conv_id = request.query.get("conv_id")
+    conv = CONVERSATIONS.get(conv_id) if conv_id else None
+    if conv is None:
+        return web.json_response({"error": "unknown_conv_id"}, status=400)
+    _ensure_conv_shape(conv)
+    state = conv["agent_tasks"].get(task_id)
+    if state is None:
+        return web.json_response({"error": "unknown_task_id", "status": "unknown"}, status=404)
+    task = state.get("task")
+    if task is not None and not task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=AGENT_TASK_LONG_POLL_SEC)
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            pass
+    if state["status"] == "running":
+        return web.json_response({"task_id": task_id, "status": "running"})
+    # Mark delivered; idempotent for duplicate pollers.
+    already = state["delivered_to_realtime"]
+    state["delivered_to_realtime"] = True
+    if not already:
+        log_call_event(LOG_DIR, conv_id, "ask_agent_delivered_to_realtime", task_id=task_id)
+    return web.json_response({
+        "task_id": task_id,
+        "status": state["status"],
+        "answer": state.get("answer") or "",
+        "already_delivered": already,
+    })
 
 
 async def text_turn(request: web.Request) -> web.Response:
@@ -296,44 +516,126 @@ async def text_turn(request: web.Request) -> web.Response:
     body = await request.json()
     conv_id = body.get("conv_id")
     user_text = (body.get("text") or "").strip()
-    if not conv_id or conv_id not in CONVERSATIONS:
+    conv = CONVERSATIONS.get(conv_id) if conv_id else None
+    if conv is None:
         return web.json_response({"error": "unknown_conv_id"}, status=400)
+    _ensure_conv_shape(conv)
     if not user_text:
         return web.json_response({"answer": ""}, status=200)
+    _touch(conv)
+    started_at = time.time()
     try:
         answer = await _agent_chat(conv_id, user_text)
     except Exception as e:  # noqa: BLE001
         log.exception("text_turn failed")
-        return web.json_response({"error": str(e)}, status=502)
-    CONVERSATIONS[conv_id]["entries"].append({"role": "user_text", "text": user_text, "ts": time.time()})
-    CONVERSATIONS[conv_id]["entries"].append({"role": "assistant_text", "text": answer, "ts": time.time()})
+        log_call_event(LOG_DIR, conv_id, "tool_error", channel="text_turn", error_type=type(e).__name__)
+        return web.json_response(_structured_unreachable(type(e).__name__), status=200)
+    finished_at = time.time()
+    conv["entries"].append({"role": "user_text", "text": user_text, "ts": started_at})
+    conv["entries"].append({"role": "assistant_text", "text": answer, "ts": finished_at})
+    conv["last_activity_ts"] = finished_at
+    log_call_event(
+        LOG_DIR, conv_id, "text_turn",
+        latency_ms=int((finished_at - started_at) * 1000), chars=len(answer),
+    )
     return web.json_response({"answer": answer})
 
 
+async def resume_call(request: web.Request) -> web.Response:
+    """Mint a fresh OpenAI Realtime ephemeral session bound to the same conv.
+
+    Returns answers the user missed while away (``completed_while_away``) so
+    the new realtime session can speak them, plus pointers to any tasks
+    still running (``still_working``) so the client can re-attach long polls.
+    """
+    body = await request.json()
+    conv_id = body.get("conv_id")
+    conv = CONVERSATIONS.get(conv_id) if conv_id else None
+    if conv is None:
+        return web.json_response({"expired": True})
+    _ensure_conv_shape(conv)
+    if not OPENAI_API_KEY:
+        return web.json_response({"error": "no_openai_key"}, status=500)
+    try:
+        data = await _mint_realtime_session()
+    except httpx.HTTPStatusError as e:
+        log.error("resume mint failed: %s %s", e.response.status_code, e.response.text[:300])
+        return web.json_response({"error": "ephemeral_mint_failed", "detail": e.response.text[:300]}, status=502)
+    except Exception as e:  # noqa: BLE001
+        log.exception("resume mint exception")
+        return web.json_response({"error": "ephemeral_mint_exception", "detail": str(e)}, status=502)
+    _touch(conv)
+    completed_while_away: list[dict] = []
+    still_working: list[dict] = []
+    now = time.time()
+    for tid, state in list(conv["agent_tasks"].items()):
+        if state["status"] in ("done", "error") and not state["delivered_to_realtime"]:
+            completed_while_away.append({
+                "task_id": tid,
+                "question": state["question"],
+                "answer": state.get("answer") or "",
+            })
+            state["delivered_to_realtime"] = True
+            log_call_event(LOG_DIR, conv_id, "ask_agent_carried_over_on_resume", task_id=tid)
+        elif state["status"] == "running":
+            still_working.append({
+                "task_id": tid,
+                "question": state["question"],
+                "elapsed_s": int(now - state["started_at"]),
+            })
+    log_call_event(
+        LOG_DIR, conv_id, "resumed",
+        completed=len(completed_while_away), still_working=len(still_working),
+    )
+    return web.json_response({
+        "conv_id": conv_id,
+        "session": data,
+        "resumed": True,
+        "completed_while_away": completed_while_away,
+        "still_working": still_working,
+    })
+
+
+def _cancel_in_flight_tasks(conv: dict) -> int:
+    n = 0
+    for tid, state in list(conv.get("agent_tasks", {}).items()):
+        task = state.get("task")
+        if task and not task.done():
+            task.cancel()
+            n += 1
+    return n
+
+
 async def end_call(request: web.Request) -> web.Response:
-    # Idempotent: browser may call this from visibilitychange, pagehide, AND
-    # the explicit End button - all on the same conv_id. Already-ended is fine.
+    """Explicit End. Backgrounding NO LONGER triggers this -- only the End
+    button or pagehide. Idempotent for duplicate fires."""
     try:
         body = await request.json()
     except Exception:
         body = {}
     conv_id = body.get("conv_id")
     client_entries = body.get("entries") or []
+    reason = body.get("reason") or "user_click"
     if not conv_id:
         return web.json_response({"ok": True, "noop": "no_conv_id"})
+    # Legacy clients may still POST with reason="visibilitychange" -- treat as a no-op
+    # so old PWA tabs don't accidentally end calls during background.
+    if reason == "visibilitychange":
+        log_call_event(LOG_DIR, conv_id, "legacy_background_end_ignored")
+        return web.json_response({"ok": True, "noop": "background_is_pause"})
     conv = CONVERSATIONS.pop(conv_id, None)
     if conv is None:
         return web.json_response({"ok": True, "noop": "already_ended"})
-    # Merge browser-captured transcript with server-side tool turns
+    cancelled = _cancel_in_flight_tasks(conv)
     all_entries = sorted(conv["entries"] + client_entries, key=lambda e: e.get("ts", 0))
     path = write_transcript(conv_id, conv["started_at"], all_entries)
     ended_at = time.time()
-    # Fire-and-forget memory ingestion
     asyncio.create_task(ingest_into_agent(
         conv_id, all_entries,
         agent_base=AGENT_API_BASE,
         agent_key=AGENT_API_KEY,
     ))
+    slack_posted = False
     if SLACK_BOT_TOKEN and SLACK_CALL_CHANNEL_ID:
         asyncio.create_task(post_to_slack(
             conv_id=conv_id,
@@ -343,26 +645,54 @@ async def end_call(request: web.Request) -> web.Response:
             slack_token=SLACK_BOT_TOKEN,
             channel_id=SLACK_CALL_CHANNEL_ID,
         ))
+        slack_posted = True
+    log_call_event(
+        LOG_DIR, conv_id, "ended",
+        reason=reason, duration_s=int(ended_at - conv["started_at"]),
+        cancelled_tasks=cancelled, slack_posted=slack_posted,
+    )
     return web.json_response({"ok": True, "transcript": str(path)})
 
 
 # ---- session reaper --------------------------------------------------------
-
-# OpenAI Realtime auto-closes sessions at ~60min; reap server-side state shortly
-# after so abandoned tabs don't leak entries forever. Also surfaces how often
-# abandonment happens via INFO logs.
-REAPER_INTERVAL_SEC = 300
-REAPER_MAX_AGE_SEC = 65 * 60
+# Backgrounding is now a pause, not an end. The reaper guards against the
+# truly-forgotten case: 20 min with zero activity (no /api/session,
+# /api/ask-agent, /api/text-turn, /api/resume, or completed agent task).
 
 
 async def _reap_stale_conversations() -> None:
     while True:
         await asyncio.sleep(REAPER_INTERVAL_SEC)
-        cutoff = time.time() - REAPER_MAX_AGE_SEC
-        stale = [cid for cid, c in CONVERSATIONS.items() if c.get("started_at", 0) < cutoff]
+        cutoff = time.time() - REAPER_IDLE_TIMEOUT_SEC
+        stale = [cid for cid, c in CONVERSATIONS.items() if c.get("last_activity_ts", c.get("started_at", 0)) < cutoff]
         for cid in stale:
-            CONVERSATIONS.pop(cid, None)
-            log.info("reaped stale conversation %s (>65min, no /api/end)", cid)
+            conv = CONVERSATIONS.pop(cid, None)
+            if conv is None:
+                continue
+            cancelled = _cancel_in_flight_tasks(conv)
+            ended_at = time.time()
+            all_entries = sorted(conv.get("entries", []), key=lambda e: e.get("ts", 0))
+            try:
+                write_transcript(cid, conv["started_at"], all_entries)
+            except Exception:  # noqa: BLE001
+                log.exception("reap: write_transcript failed for %s", cid)
+            slack_posted = False
+            if SLACK_BOT_TOKEN and SLACK_CALL_CHANNEL_ID:
+                asyncio.create_task(post_to_slack(
+                    conv_id=cid,
+                    started_at=conv["started_at"],
+                    ended_at=ended_at,
+                    entries=all_entries,
+                    slack_token=SLACK_BOT_TOKEN,
+                    channel_id=SLACK_CALL_CHANNEL_ID,
+                ))
+                slack_posted = True
+            log.info("reaped idle conversation %s (>%dmin no activity)", cid, REAPER_IDLE_TIMEOUT_SEC // 60)
+            log_call_event(
+                LOG_DIR, cid, "reaped",
+                reason="idle_timeout", duration_s=int(ended_at - conv["started_at"]),
+                cancelled_tasks=cancelled, slack_posted=slack_posted,
+            )
 
 
 async def _start_reaper(app: web.Application) -> None:
@@ -381,14 +711,32 @@ async def _stop_reaper(app: web.Application) -> None:
 
 # ---- app -------------------------------------------------------------------
 
+@web.middleware
+async def no_cache_static_middleware(request: web.Request, handler):
+    """Force iOS PWA / Safari to revalidate the SPA shell on every load.
+
+    Without this, the realtime tool name was cached as `ask_hermes` after the
+    repo rename, breaking every voice session until the user wiped the PWA.
+    """
+    resp = await handler(request)
+    path = request.path
+    if path == "/" or path.startswith("/static/") or path.endswith(".webmanifest"):
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    return resp
+
+
 def make_app() -> web.Application:
-    app = web.Application(middlewares=[tailnet_middleware], client_max_size=8 * 1024 * 1024)
+    app = web.Application(middlewares=[tailnet_middleware, no_cache_static_middleware], client_max_size=8 * 1024 * 1024)
     app.on_startup.append(_start_reaper)
     app.on_cleanup.append(_stop_reaper)
     app.router.add_get("/api/health", health)
     app.router.add_post("/api/session", session_mint)
     app.router.add_post("/api/ask-agent", ask_agent)
+    app.router.add_get("/api/agent-task/{task_id}", agent_task)
     app.router.add_post("/api/text-turn", text_turn)
+    app.router.add_post("/api/resume", resume_call)
     app.router.add_post("/api/end", end_call)
     # Static SPA - index.html and /static/*
     app.router.add_get("/", lambda r: web.FileResponse(HERE / "web" / "index.html"))

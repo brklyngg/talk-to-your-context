@@ -9,8 +9,13 @@
   <meta name="apple-mobile-web-app-title" content="Agent">
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="apple-touch-icon" href="/static/icon-512.png">
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=2">
   <title>Talk to Your Context</title>
+  <!-- Disable HTTP cache for the SPA shell; iOS PWAs in particular hoard
+       assets indefinitely without explicit no-cache directives. -->
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
 </head>
 <body>
   <main id="app">
@@ -38,6 +43,6 @@
       <button id="end" class="danger" hidden>End</button>
     </footer>
   </main>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=2"></script>
 </body>
 </html>
