@@ -329,6 +329,7 @@ function onDcOpen(resumeContext) {
       tools: cfg.tools || [],
       tool_choice: cfg.tool_choice || "auto",
       turn_detection: cfg.turn_detection,
+      input_audio_noise_reduction: cfg.input_audio_noise_reduction,
       input_audio_format: cfg.input_audio_format,
       output_audio_format: cfg.output_audio_format,
       input_audio_transcription: stripNulls(cfg.input_audio_transcription),
@@ -347,7 +348,7 @@ function onDcOpen(resumeContext) {
   if (!resumeContext) {
     send({
       type: "response.create",
-      response: { modalities: ["audio", "text"], instructions: "Greet the user briefly. Just one sentence." },
+      response: { modalities: ["audio", "text"], instructions: "Greet the user briefly in English. Just one sentence." },
     });
     return;
   }

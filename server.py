@@ -151,8 +151,10 @@ CRITICAL TOOL-CALL RULES:
 1. For ANY substantive question - calendar, email, memory, projects, drafting,
    research, anything beyond pure small talk - call ask_agent.
 2. During an ask_agent call you may say one short bridging line ("one sec",
-   "looking now") if the wait is going long, but never invent the answer
-   while waiting. Short interjections are fine; running narration is not.
+   "looking now") if the wait is going long. If the wait exceeds ~25 seconds,
+   drop another brief "still working on it" beat every 20-30 seconds so the
+   user knows you haven't dropped. Never invent the answer while waiting.
+   Short interjections are fine; running narration is not.
 3. After the tool result arrives, speak the answer naturally and briefly.
    Phone-call tempo: <=2 sentences per turn unless asked for more. Numbers
    spoken naturally ("ten thirty", not "10:30 colon zero zero"). No markdown.
@@ -187,6 +189,9 @@ CAPABILITIES (TRUTH - DO NOT CONTRADICT):
 - Questions about your model, voice, logs, file capabilities, or where data
   lives must be answered via ask_agent. The agent knows its own setup; you
   do not. Do not improvise refusals like "I don't have access to that".
+
+LANGUAGE:
+- Always speak English unless the user explicitly switches mid-conversation.
 """
 
 VOICE_SYSTEM_PROMPT = (
@@ -298,10 +303,25 @@ async def _mint_realtime_session() -> dict:
         "instructions": VOICE_SYSTEM_PROMPT,
         "tools": [ASK_AGENT_TOOL_SCHEMA],
         "tool_choice": "auto",
-        "turn_detection": {"type": "server_vad", "threshold": 0.5, "silence_duration_ms": 500},
+        "turn_detection": {
+            "type": "semantic_vad",
+            "eagerness": "low",
+            "create_response": True,
+            "interrupt_response": True,
+        },
+        "input_audio_noise_reduction": {"type": "near_field"},
         "input_audio_format": "pcm16",
         "output_audio_format": "pcm16",
-        "input_audio_transcription": {"model": "whisper-1"},
+        "input_audio_transcription": {
+            "model": "gpt-4o-mini-transcribe",
+            "language": "en",
+            "prompt": (
+                "Gary Gurevich, Crunchy Numbers, Crunchy Tools, Flowocity, Hermes, "
+                "Jerome, Claude, OpenClaw, Paperclip, Rillet, Pat Leahy, "
+                "Y Combinator, Obsidian, Supabase, Vercel, Tailscale, fractional CFO, "
+                "P&L, GL, RFS, AI-native agency."
+            ),
+        },
         "max_response_output_tokens": 1500,
     }
     async with httpx.AsyncClient(timeout=15) as client:
