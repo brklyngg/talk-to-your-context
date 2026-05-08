@@ -21,9 +21,11 @@ let convId = null;
 let started = false;
 let micMuted = false;
 let audioCtx = null;
-let icebreaker = null;     // {fadeIn, fadeOut} -- kept as no-op shim; gpt-realtime's
-                           // native async tool calling means we no longer need the
-                           // brown-noise rumble during ask_agent.
+let icebreaker = null;     // {fadeIn, fadeOut, dispose} — restored as a comfort
+                           // signal during ask_agent waits. Defaults to procedural
+                           // brown noise; transparently swaps to /static/ambient.mp3
+                           // (Suno track) when present and idle.
+let ambientBuffer = null;  // decoded AudioBuffer cached when /static/ambient.mp3 served
 let activeToolCalls = 0;
 const clientEntries = [];  // {role, text, ts, latencyMs?} for end-of-call upload
 let pendingAssistantBubble = null;
@@ -132,6 +134,67 @@ function isErrorAnswer(answer) {
   return typeof answer === "string" && answer.startsWith("Agent is temporarily unreachable");
 }
 
+// --------------- Icebreaker (comfort bed during ask_agent) ---------------
+
+function createBrownNoiseIcebreaker(ctx) {
+  const len = ctx.sampleRate * 2;
+  const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+  const ch = buf.getChannelData(0);
+  let last = 0;
+  for (let i = 0; i < len; i++) {
+    const white = Math.random() * 2 - 1;
+    last = (last + 0.02 * white) / 1.02;
+    ch[i] = last * 3.5;
+  }
+  const src = ctx.createBufferSource();
+  src.buffer = buf; src.loop = true;
+  const lp = ctx.createBiquadFilter();
+  lp.type = "lowpass"; lp.frequency.value = 200; lp.Q.value = 0.7;
+  const master = ctx.createGain(); master.gain.value = 0;
+  const lfo = ctx.createOscillator(); lfo.frequency.value = 0.3;
+  const lfoGain = ctx.createGain(); lfoGain.gain.value = 0.05;
+  src.connect(lp).connect(master).connect(ctx.destination);
+  lfo.connect(lfoGain).connect(master.gain);
+  src.start(); lfo.start();
+  const fade = (target, dur = 0.25) =>
+    master.gain.linearRampToValueAtTime(target, ctx.currentTime + dur);
+  return {
+    fadeIn: () => fade(0.35),
+    fadeOut: () => fade(0.0),
+    dispose: () => {
+      try { src.stop(); lfo.stop(); src.disconnect(); lp.disconnect(); master.disconnect(); lfoGain.disconnect(); } catch {}
+    },
+  };
+}
+
+function createSampleIcebreaker(ctx, buffer) {
+  const src = ctx.createBufferSource();
+  src.buffer = buffer; src.loop = true;
+  const master = ctx.createGain(); master.gain.value = 0;
+  src.connect(master).connect(ctx.destination);
+  src.start();
+  // setTargetAtTime with τ=dur/3 reaches ~95% of target in `dur` seconds —
+  // exponential decay, no audible dead-stop at the endpoint.
+  const fade = (target, dur = 0.4) =>
+    master.gain.setTargetAtTime(target, ctx.currentTime, dur / 3);
+  return {
+    fadeIn: () => fade(0.32),
+    fadeOut: () => fade(0.0),
+    dispose: () => {
+      setTimeout(() => { try { src.stop(); src.disconnect(); master.disconnect(); } catch {} }, 600);
+    },
+  };
+}
+
+function maybeSwapToSampleIcebreaker() {
+  if (!audioCtx || !ambientBuffer || !icebreaker) return;
+  if (activeToolCalls !== 0) return;  // bed is currently faded in; defer
+  const old = icebreaker;
+  icebreaker = createSampleIcebreaker(audioCtx, ambientBuffer);
+  old.dispose();
+  logClientEvent("client_icebreaker_source", { kind: "sample" });
+}
+
 // --------------- Health ---------------
 
 async function checkHealth() {
@@ -224,10 +287,16 @@ async function startCall() {
     return;
   }
 
-  // AudioContext kept around for future UI cues (e.g., subtle haptic-like tone).
-  // Brown-noise icebreaker is intentionally NOT started: gpt-realtime now handles
-  // async tool calls natively and can converse during the wait.
+  // AudioContext + comfort bed during ask_agent waits. Brown noise is the default
+  // (procedural, always available); if /static/ambient.mp3 is served, we swap to
+  // it transparently once the buffer decodes and the bed is idle.
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  icebreaker = createBrownNoiseIcebreaker(audioCtx);
+  fetch("/static/ambient.mp3", { cache: "no-cache" })
+    .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error("no ambient asset"))))
+    .then((buf) => audioCtx.decodeAudioData(buf))
+    .then((decoded) => { ambientBuffer = decoded; maybeSwapToSampleIcebreaker(); })
+    .catch(() => { logClientEvent("client_icebreaker_source", { kind: "brown_noise" }); });
 
   started = true;
   endBtn.hidden = false;
@@ -474,6 +543,7 @@ function onDcMessage(ev) {
           appendBubble("tool", "thinking...");
           setStatus("agent is thinking...", "thinking");
           setDot("thinking");
+          if (icebreaker) icebreaker.fadeIn();
         }
       }
       break;
@@ -572,6 +642,10 @@ async function handleAskAgent(callId, question) {
     if (activeToolCalls === 0) {
       setStatus("connected", "live");
       setDot("ok");
+      if (icebreaker) icebreaker.fadeOut();
+      // If the Suno asset finished decoding mid-call, the swap was deferred.
+      // Now that the bed is idle, retry — silent because both sit at gain 0.
+      maybeSwapToSampleIcebreaker();
     }
   }
   if (taskId) deliveredTaskIds.add(taskId);
@@ -683,6 +757,8 @@ function cleanupCall() {
   micMuted = false;
   muteBtn.textContent = "\u{1F507}";
   if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
+  if (icebreaker) { try { icebreaker.fadeOut(); icebreaker.dispose(); } catch {} icebreaker = null; }
+  ambientBuffer = null;
   if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
   if (dc) { try { dc.close(); } catch {} dc = null; }
   if (pc) { try { pc.close(); } catch {} pc = null; }
