@@ -426,7 +426,7 @@ function onDcOpen(resumeContext) {
   if (!resumeContext) {
     send({
       type: "response.create",
-      response: { modalities: ["audio", "text"], instructions: "Greet the user briefly in English. Just one sentence." },
+      response: { output_modalities: ["audio"], instructions: "Greet the user briefly in English. Just one sentence." },
     });
     return;
   }
@@ -524,7 +524,7 @@ async function requestHandoffNote(reason) {
           "No greeting, no flattery, no filler. Output only the note." }],
       },
     }));
-    dc.send(JSON.stringify({ type: "response.create", response: { modalities: ["text"] } }));
+    dc.send(JSON.stringify({ type: "response.create", response: { output_modalities: ["text"] } }));
   } catch (e) {
     activeHandoffRequest = null;
     logClientEvent("client_handoff_note_failed", { reason, error: String(e) });
