@@ -52,10 +52,15 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2")
 OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
 AGENT_API_BASE = os.getenv("AGENT_API_BASE", "http://127.0.0.1:8642").rstrip("/")
-# Total timeout cap on a single ask_agent forward to the backend. The model's
-# native preambles + async function calling fill any in-call wait; this only
-# bounds the absolute worst case (Hermes hung, network wedged, etc.).
-ASK_AGENT_TIMEOUT_SEC = float(os.getenv("ASK_AGENT_TIMEOUT_SEC", "90"))
+# Liveness model for ask_agent forwards:
+#   - ASK_AGENT_IDLE_TIMEOUT_SEC: primary watchdog, surfaced via httpx's `read`
+#     timeout. Raises httpx.ReadTimeout if no SSE bytes arrive within the
+#     window mid-stream — catches a hung backend without killing legitimately
+#     slow streaming work.
+#   - ASK_AGENT_TIMEOUT_SEC: runaway guard via asyncio.wait_for. Catches the
+#     pathological "backend dribbles forever" case.
+ASK_AGENT_TIMEOUT_SEC = float(os.getenv("ASK_AGENT_TIMEOUT_SEC", "600"))
+ASK_AGENT_IDLE_TIMEOUT_SEC = float(os.getenv("ASK_AGENT_IDLE_TIMEOUT_SEC", "45"))
 HOST = os.getenv("VOICE_HOST", "127.0.0.1")
 PORT = int(os.getenv("VOICE_PORT", "8090"))
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
@@ -276,8 +281,15 @@ async def _agent_chat_inner(conv_id: str, user_text: str) -> str:
     """
     if not AGENT_API_KEY:
         raise RuntimeError("Agent API key not configured")
-    # Per-chunk read timeout is loose because asyncio.wait_for caps total time.
-    timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+    # `read` is the idle-gap watchdog: max time between SSE bytes from the
+    # backend. If the backend goes silent, httpx raises ReadTimeout. Total
+    # wall time is bounded separately by `_agent_chat`.
+    timeout = httpx.Timeout(
+        connect=10.0,
+        read=ASK_AGENT_IDLE_TIMEOUT_SEC,
+        write=10.0,
+        pool=10.0,
+    )
     chunks: list[str] = []
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream(
@@ -494,9 +506,15 @@ async def ask_agent(request: web.Request) -> web.Response:
         answer = await _agent_chat(conv_id, question)
         status = "done"
     except asyncio.TimeoutError:
-        answer = _structured_unreachable("timeout")["answer"]
+        # Outer wall-clock cap fired (ASK_AGENT_TIMEOUT_SEC).
+        answer = _structured_unreachable("runaway")["answer"]
         status = "error"
-        error_type = "timeout"
+        error_type = "runaway"
+    except httpx.ReadTimeout:
+        # Idle-gap watchdog fired: backend went silent mid-stream.
+        answer = _structured_unreachable("idle")["answer"]
+        status = "error"
+        error_type = "idle"
     except httpx.TimeoutException:
         answer = _structured_unreachable("timeout")["answer"]
         status = "error"
