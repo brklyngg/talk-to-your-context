@@ -829,6 +829,8 @@ function onDcMessage(ev) {
           intent_type: typeof args.intent_type === "string" ? args.intent_type : null,
           freshness_required: typeof args.freshness_required === "boolean" ? args.freshness_required : null,
         });
+      } else if (name === "triage_verdict") {
+        handleTriageVerdict(msg.call_id, args);
       } else {
         sendFunctionOutput(msg.call_id, JSON.stringify({ error: `unknown tool ${name}` }));
       }
@@ -918,6 +920,21 @@ async function handleAskAgent(callId, question, routing) {
   // Always feed something back to the realtime peer so it doesn't hang on the
   // function call. Structured-error sentinel triggers prompt rule #10.
   sendFunctionOutput(callId, answer || "Agent is temporarily unreachable - please ask the user to repeat that.");
+}
+
+async function handleTriageVerdict(callId, args) {
+  let output;
+  try {
+    const r = await fetch("/api/triage-verdict", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conv_id: convId, call_id: callId, ...args }),
+    });
+    output = JSON.stringify(await r.json());
+  } catch (e) {
+    output = JSON.stringify({ recorded: false, error: e.message });
+  }
+  sendFunctionOutput(callId, output);
 }
 
 // --------------- Mute / End / Text mode ---------------

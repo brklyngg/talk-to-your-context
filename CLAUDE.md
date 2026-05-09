@@ -39,12 +39,20 @@ node --check web/app.js
 2. **Sidecar** (`server.py`, aiohttp). Mints Realtime ephemeral sessions, owns the `CONVERSATIONS` in-memory dict, synchronously forwards `ask_agent` to the agent backend, exposes the resume/premint/handoff endpoints, persists transcripts.
 3. **Agent backend** (external). Reached via `AGENT_API_BASE` (default `http://127.0.0.1:8642`). Speaks OpenAI-style chat-completions SSE. The sidecar streams `_agent_chat()` against it. Bring your own. (Phase 2: this contract migrates to remote MCP via Tailscale Funnel.)
 
-**`ask_agent` flow (post-cutover, May 2026):**
+**Two Realtime tools registered per session:** `ask_agent` (core) and `triage_verdict` (open-loops integration; described below).
+
+**`ask_agent` flow:**
 - Realtime emits a `function_call` for `ask_agent` over the data channel.
 - Tool args carry routing telemetry: `intent_type` (lookup/action/drafting/reasoning/verification/other) and `freshness_required` bool. The model is told to answer in-session for clarifications/recaps/comparisons/refinements; only escalate when external/current/cross-session context is genuinely needed. Both fields are logged, not branched on — see `events.py:compute_routing_metrics`.
 - Client POSTs `/api/ask-agent` → server forwards synchronously to the backend → returns the answer inline. No task IDs, no long-poll, no fast-path machinery. gpt-realtime-2's native preambles + async function calling keep the conversation flowing through the wait.
 - The client renders a subtle "Consulting deep context: [topic]" status chip on the assistant's bubble while the call is in flight. Phrasing describes the action, not the architecture (no "asking your brain" / "calling the agent" framing — exposing the split-brain seam is bad UX).
 - Total wait capped by `ASK_AGENT_TIMEOUT_SEC` (default 90s). Failures surface via the `_AGENT_UNREACHABLE_SENTINEL` envelope so prompt rule #10 fires.
+
+**`triage_verdict` flow + open-loops integration:**
+- A second function tool registered alongside `ask_agent`. Args: `loop_id`, `verdict ∈ {drop, park, act}`, optional `next_action`, `calendar_when`, `note`.
+- At session-mint, `_load_open_loops_brief()` lazy-imports `~/.hermes-custom/open-loops/brief_format.py`, reads `~/.hermes/open-loops/today.json`, and returns a formatted brief if `generated_at` is today (NY tz). The brief is appended to the system prompt via `instructions_suffix`. Off-window calls get an empty suffix → normal Hermes session.
+- Client routes `triage_verdict` function_calls to `POST /api/triage-verdict` → server validates and appends `{role: "triage_verdict", ...}` to the conv transcript → returns `{recorded: true}` immediately. Reconcile cron (in the open-loops repo) reads these entries from the persisted transcript and creates `[Hermes Draft]`-prefixed calendar events for `act` verdicts.
+- The open-loops repo is an optional sibling. The proxy works fine without it (lazy import, returns `None` on failure).
 
 **Forced-reconnect continuity machinery (load-bearing, non-obvious):**
 Realtime sessions hard-die at the 60-min cap; mobile resumes (visibility, network blip, silent freeze, `session_expired`) all funnel through `triggerResume` → `/api/resume`. Without intervention, the new session is amnesic. Two mechanisms preserve continuity:
@@ -60,7 +68,7 @@ Realtime sessions hard-die at the 60-min cap; mobile resumes (visibility, networ
 
 ## Key files
 
-- `server.py` — sidecar; endpoints (`/api/session`, `/api/ask-agent`, `/api/text-turn`, `/api/resume`, `/api/premint-session`, `/api/handoff-note`, `/api/end`, `/api/client-event`, `/api/health`).
+- `server.py` — sidecar; endpoints (`/api/session`, `/api/ask-agent`, `/api/text-turn`, `/api/resume`, `/api/premint-session`, `/api/handoff-note`, `/api/end`, `/api/client-event`, `/api/triage-verdict`, `/api/health`).
 - `web/app.js` — browser client; WebRTC peer + dc message switch (`onDcMessage`), `attachPeer`, `onDcOpen`, `triggerResume`, `gracefulCapSwap`, `cleanupCall`, `showConsultingChip`/`updateConsultingChip` (status indicator), markdown renderer for displayed tool-answer bubbles.
 - `events.py` — append-only NDJSON per-call event logger (`log_call_event`); `compute_routing_metrics` derives ask_agent count vs in-session local-answer turns.
 - `transcripts.py` — end-of-call transcript persistence + optional Slack archive.

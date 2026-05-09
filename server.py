@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import secrets
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict
@@ -139,6 +140,47 @@ ASK_AGENT_TOOL_SCHEMA = {
         "required": ["question", "intent_type", "freshness_required"],
     },
 }
+
+
+TRIAGE_VERDICT_TOOL_SCHEMA = {
+    "type": "function",
+    "name": "triage_verdict",
+    "description": (
+        "Record Gary's verdict on an open loop the moment a decision is reached. "
+        "DEFAULT TO 'drop' if Gary signals indifference, fatigue, or vague intent. "
+        "Only use 'park' for items he explicitly defers with a reason. "
+        "Only use 'act' when he commits to a concrete next step with a date/time. "
+        "Strategic discipline: maintenance/curiosity loops should drop unless they "
+        "concretely unlock revenue, distribution, authority, or compounding capability."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "loop_id": {"type": "string", "description": "The ol_<hash> ID from the briefing"},
+            "verdict": {"type": "string", "enum": ["drop", "park", "act"]},
+            "next_action": {"type": "string", "description": "For 'act' only: the concrete next step Gary stated"},
+            "calendar_when": {"type": "string", "description": "For 'act' only: ISO datetime or natural language"},
+            "note": {"type": "string", "description": "Optional brief context"},
+        },
+        "required": ["loop_id", "verdict"],
+    },
+}
+
+
+def _load_open_loops_brief() -> str | None:
+    """Load today's open-loops brief if fresh; else None.
+
+    Imports lazily so the open-loops repo is only required when actually used.
+    """
+    try:
+        ol_path = os.path.expanduser("~/.hermes-custom/open-loops")
+        if ol_path not in sys.path:
+            sys.path.insert(0, ol_path)
+        from brief_format import render  # type: ignore
+        return render()
+    except Exception:
+        return None
+
 
 # Optional deployment-specific facts the realtime model can rely on without
 # guessing. Inject things like "your filesystem-write tools are real" or
@@ -328,7 +370,7 @@ async def _mint_realtime_session(instructions_suffix: str | None = None) -> dict
             "type": "realtime",
             "model": OPENAI_REALTIME_MODEL,
             "instructions": instructions,
-            "tools": [ASK_AGENT_TOOL_SCHEMA],
+            "tools": [ASK_AGENT_TOOL_SCHEMA, TRIAGE_VERDICT_TOOL_SCHEMA],
             "tool_choice": "auto",
             "output_modalities": ["audio"],
             "max_output_tokens": 1500,
@@ -388,7 +430,7 @@ async def session_mint(request: web.Request) -> web.Response:
         "entries": [],
     }
     try:
-        data = await _mint_realtime_session()
+        data = await _mint_realtime_session(instructions_suffix=_load_open_loops_brief())
     except httpx.HTTPStatusError as e:
         log.error("ephemeral mint failed: %s %s", e.response.status_code, e.response.text[:300])
         return web.json_response({"error": "ephemeral_mint_failed", "detail": e.response.text[:300]}, status=502)
@@ -735,6 +777,42 @@ async def _stop_reaper(app: web.Application) -> None:
 
 # ---- app -------------------------------------------------------------------
 
+async def triage_verdict(request: web.Request) -> web.Response:
+    """Record a structured triage_verdict tool call into the conv transcript.
+
+    Returns immediately. Reconcile cron reads these entries from the
+    persisted voice transcript and creates calendar events for `act` verdicts.
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return web.json_response({"error": "bad_json"}, status=400)
+    conv_id = body.get("conv_id")
+    conv = CONVERSATIONS.get(conv_id) if conv_id else None
+    if conv is None:
+        return web.json_response({"error": "unknown_conv_id"}, status=400)
+    _ensure_conv_shape(conv)
+    verdict = (body.get("verdict") or "").lower()
+    if verdict not in ("drop", "park", "act"):
+        return web.json_response({"error": "bad_verdict"}, status=400)
+    loop_id = (body.get("loop_id") or "").strip()
+    if not loop_id:
+        return web.json_response({"error": "missing_loop_id"}, status=400)
+    entry = {
+        "role": "triage_verdict",
+        "ts": time.time(),
+        "loop_id": loop_id,
+        "verdict": verdict,
+        "next_action": body.get("next_action") or "",
+        "calendar_when": body.get("calendar_when") or "",
+        "note": body.get("note") or "",
+    }
+    conv["entries"].append(entry)
+    conv["last_activity_ts"] = entry["ts"]
+    log_call_event(LOG_DIR, conv_id, "triage_verdict", loop_id=loop_id, verdict=verdict)
+    return web.json_response({"recorded": True})
+
+
 @web.middleware
 async def no_cache_static_middleware(request: web.Request, handler):
     """Force iOS PWA / Safari to revalidate the SPA shell on every load.
@@ -764,6 +842,7 @@ def make_app() -> web.Application:
     app.router.add_post("/api/premint-session", premint_session)
     app.router.add_post("/api/handoff-note", handoff_note)
     app.router.add_post("/api/end", end_call)
+    app.router.add_post("/api/triage-verdict", triage_verdict)
     # Static SPA - index.html and /static/*
     app.router.add_get("/", lambda r: web.FileResponse(HERE / "web" / "index.html"))
     app.router.add_get("/manifest.webmanifest", lambda r: web.FileResponse(HERE / "web" / "manifest.webmanifest"))
