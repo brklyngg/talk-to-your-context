@@ -37,16 +37,6 @@ let connDownSinceTs = null;
 let resumeInFlight = false;
 let watchdogTimer = null;
 
-// Last minted/resumed session config; echoed via session.update on dc-open as
-// defensive insurance against the documented `gpt-realtime` tools-drop quirk
-// where tools registered at ephemeral-mint are silently lost in some flows.
-// gpt-realtime-2 GA may have fixed this — kept as a belt-and-suspenders
-// defense since the cost of being wrong is "ask_agent never fires."
-// The handoff-note continuation suffix is baked into the server-minted
-// instructions, so we just echo whatever the server gave us — no client-side
-// concatenation needed.
-let lastSessionConfig = null;
-
 // --- Forced-reconnect continuity state ---
 // `responseInFlight` flips on response.created and back on response.done. The
 // handoff-note request is gated on it being false (one outstanding response at
@@ -350,9 +340,12 @@ async function attachPeer(session, resumeContext) {
   setStatus(resumeContext ? "resuming..." : "connecting...");
   const offer = await newPc.createOffer();
   await newPc.setLocalDescription(offer);
-  const sdpResp = await fetch(`https://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`, {
+  // GA endpoint (May 2026): /v1/realtime/calls. Ephemeral key encodes model
+  // + session config from the mint, so no ?model= query param needed and
+  // no OpenAI-Beta header.
+  const sdpResp = await fetch("https://api.openai.com/v1/realtime/calls", {
     method: "POST",
-    headers: { Authorization: `Bearer ${ephemeral}`, "Content-Type": "application/sdp", "OpenAI-Beta": "realtime=v1" },
+    headers: { Authorization: `Bearer ${ephemeral}`, "Content-Type": "application/sdp" },
     body: offer.sdp,
   });
   if (!sdpResp.ok) throw new Error(`sdp ${sdpResp.status}: ${await sdpResp.text()}`);
@@ -392,7 +385,6 @@ async function startCall() {
     return;
   }
   convId = session.conv_id;
-  lastSessionConfig = session.session || null;
   try {
     await attachPeer(session, null);
   } catch (e) {
@@ -422,45 +414,12 @@ async function startCall() {
 }
 
 function onDcOpen(resumeContext) {
-  // Re-assert session config over the data channel as defense against the
-  // documented `gpt-realtime` tools-drop quirk (tools silently lost in some
-  // flows). gpt-realtime-2 GA may have fixed this; kept as belt-and-suspenders
-  // since the cost of being wrong is "ask_agent never fires."
-  // NOTE: omit `voice` — it is locked after first audio response and including
-  // it on resume tears the session down. Strip nulls (mint accepts null
-  // input_audio_transcription.language but session.update rejects it).
-  // The handoff-note continuation is baked into cfg.instructions server-side
-  // via _mint_realtime_session(instructions_suffix=...) — we just echo it back.
-  const cfg = lastSessionConfig || {};
-  if (cfg.tools || cfg.instructions) {
-    const stripNulls = (obj) => {
-      if (!obj || typeof obj !== "object") return obj;
-      const out = {};
-      for (const [k, v] of Object.entries(obj)) {
-        if (v !== null && v !== undefined) out[k] = v;
-      }
-      return out;
-    };
-    const sessionPatch = {
-      modalities: cfg.modalities || ["audio", "text"],
-      instructions: cfg.instructions,
-      tools: cfg.tools || [],
-      tool_choice: cfg.tool_choice || "auto",
-      turn_detection: cfg.turn_detection,
-      input_audio_noise_reduction: cfg.input_audio_noise_reduction,
-      input_audio_format: cfg.input_audio_format,
-      output_audio_format: cfg.output_audio_format,
-      input_audio_transcription: stripNulls(cfg.input_audio_transcription),
-      max_response_output_tokens: cfg.max_response_output_tokens,
-    };
-    send({ type: "session.update", session: stripNulls(sessionPatch) });
-  }
+  // GA Realtime (May 2026): tools/instructions/audio config are baked into
+  // the ephemeral at mint time and honored without a follow-up session.update.
+  // The handoff-note continuation is spliced into instructions server-side
+  // via _mint_realtime_session(instructions_suffix=...).
   logClientEvent("client_dc_opened", {
-    tools_in_session: (cfg.tools || []).map((t) => t.name),
-    tool_choice: cfg.tool_choice || null,
-    instructions_chars: (cfg.instructions || "").length,
     resume: !!resumeContext,
-    session_update_sent: !!(cfg.tools || cfg.instructions),
     handoff_note_chars: (resumeContext?.handoff_note || "").length,
   });
 
@@ -675,17 +634,17 @@ async function gracefulCapSwap() {
     }
     if (dc) { try { dc.close(); } catch {} dc = null; }
     if (pc) { try { pc.close(); } catch {} pc = null; }
-    // Transport from the pre-minted session; handoff_note/instructions already
-    // baked into claim.session.instructions server-side. NOTE: the pre-minted
-    // session was minted *before* the handoff note existed, so its instructions
-    // lack the continuation suffix. Use claim.session.instructions instead so
-    // session.update echoes the right text.
-    const mergedSession = {
-      ...premintedSession.session,
-      instructions: claim.session?.instructions || premintedSession.session.instructions,
-    };
-    const transport = { ...claim, session: mergedSession };
-    lastSessionConfig = mergedSession;
+    // The pre-minted ephemeral was minted *before* the handoff note existed —
+    // its baked-in instructions lack the continuation suffix. Trade-off: we
+    // use the pre-minted ephemeral for transport (it's ready) and accept that
+    // the model won't have the handoff-note context until next cap-swap. For
+    // a richer continuity, fall back to the claim's freshly-minted ephemeral
+    // (which DOES have the suffix) and discard the pre-mint. ~200ms slower
+    // but preserves the handoff-note → instructions chain.
+    const useFreshClaim = !!(claim.session?.client_secret?.value);
+    const transport = useFreshClaim
+      ? claim
+      : { ...claim, session: premintedSession.session };
     premintedSession = null;
     premintedExpiresAt = null;
     await attachPeer(transport, claim);
@@ -726,7 +685,6 @@ async function triggerResume(reason, { silent = false } = {}) {
       cleanupCall();
       return;
     }
-    lastSessionConfig = data.session || null;
     await attachPeer(data, data);
     setStatus("connected", "live");
   } catch (e) {

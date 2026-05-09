@@ -305,53 +305,76 @@ async def health(request: web.Request) -> web.Response:
 async def _mint_realtime_session(instructions_suffix: str | None = None) -> dict:
     """Mint an OpenAI Realtime ephemeral session. Raises on HTTP/network error.
 
-    ``instructions_suffix`` is appended to the base ``VOICE_SYSTEM_PROMPT`` —
-    used on resume to splice in a handoff-note continuation directive without
-    requiring a follow-up session.update from the client.
+    Uses the May 2026 GA endpoint (/v1/realtime/client_secrets). The session
+    config is nested under ``session`` and audio under ``audio.input`` /
+    ``audio.output``. ``instructions_suffix`` is appended to ``VOICE_SYSTEM_PROMPT``
+    so a handoff-note continuation can be baked into the freshly-minted
+    instructions on resume.
+
+    Returns a legacy-compatible shape so the existing client code keeps reading
+    ``session.client_secret.value`` and ``session.client_secret.expires_at``.
     """
     instructions = VOICE_SYSTEM_PROMPT
     if instructions_suffix:
         instructions = instructions + "\n\n" + instructions_suffix
+    transcription_prompt = (
+        "Gary Gurevich, Crunchy Numbers, Crunchy Tools, Flowocity, Hermes, "
+        "Jerome, Claude, OpenClaw, Paperclip, Rillet, Pat Leahy, "
+        "Y Combinator, Obsidian, Supabase, Vercel, Tailscale, fractional CFO, "
+        "P&L, GL, RFS, AI-native agency."
+    )
     body = {
-        "model": OPENAI_REALTIME_MODEL,
-        "voice": OPENAI_REALTIME_VOICE,
-        "modalities": ["audio", "text"],
-        "instructions": instructions,
-        "tools": [ASK_AGENT_TOOL_SCHEMA],
-        "tool_choice": "auto",
-        "turn_detection": {
-            "type": "semantic_vad",
-            "eagerness": "low",
-            "create_response": True,
-            "interrupt_response": True,
-        },
-        "input_audio_noise_reduction": {"type": "near_field"},
-        "input_audio_format": "pcm16",
-        "output_audio_format": "pcm16",
-        "input_audio_transcription": {
-            "model": "gpt-4o-mini-transcribe",
-            "language": "en",
-            "prompt": (
-                "Gary Gurevich, Crunchy Numbers, Crunchy Tools, Flowocity, Hermes, "
-                "Jerome, Claude, OpenClaw, Paperclip, Rillet, Pat Leahy, "
-                "Y Combinator, Obsidian, Supabase, Vercel, Tailscale, fractional CFO, "
-                "P&L, GL, RFS, AI-native agency."
-            ),
-        },
-        "max_response_output_tokens": 1500,
+        "session": {
+            "type": "realtime",
+            "model": OPENAI_REALTIME_MODEL,
+            "instructions": instructions,
+            "tools": [ASK_AGENT_TOOL_SCHEMA],
+            "tool_choice": "auto",
+            "output_modalities": ["audio"],
+            "max_output_tokens": 1500,
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                    "noise_reduction": {"type": "near_field"},
+                    "transcription": {
+                        "model": "gpt-4o-mini-transcribe",
+                        "language": "en",
+                        "prompt": transcription_prompt,
+                    },
+                    "turn_detection": {
+                        "type": "semantic_vad",
+                        "eagerness": "low",
+                        "create_response": True,
+                        "interrupt_response": True,
+                    },
+                },
+                "output": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                    "voice": OPENAI_REALTIME_VOICE,
+                },
+            },
+        }
     }
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(
-            "https://api.openai.com/v1/realtime/sessions",
+            "https://api.openai.com/v1/realtime/client_secrets",
             headers={
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
                 "Content-Type": "application/json",
-                "OpenAI-Beta": "realtime=v1",
             },
             json=body,
         )
         r.raise_for_status()
-        return r.json()
+        ga = r.json()
+    # Reshape GA response to the legacy contract the client expects.
+    inner = ga.get("session") or {}
+    return {
+        "client_secret": {
+            "value": ga.get("value"),
+            "expires_at": ga.get("expires_at"),
+        },
+        "model": inner.get("model") or OPENAI_REALTIME_MODEL,
+    }
 
 
 async def session_mint(request: web.Request) -> web.Response:
