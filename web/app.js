@@ -803,6 +803,10 @@ function onDcMessage(ev) {
         turnTiming.firstTokenTs = null;
         appendBubble("user", text, { createdAt: userDoneTs });
         recordEntry("user", text);
+        // Phase 0 routing telemetry: 1 event per user turn. Server derives
+        // local_answer_turns = user_turns - ask_agent_count. See
+        // events.py:compute_routing_metrics.
+        logClientEvent("client_user_turn", { chars: text.length });
       }
       break;
     }
@@ -837,7 +841,10 @@ function onDcMessage(ev) {
       try { args = JSON.parse(buf?.args || msg.arguments || "{}"); } catch {}
       fnCallBuffers.delete(msg.call_id);
       if (name === "ask_agent") {
-        handleAskAgent(msg.call_id, args.question || "");
+        handleAskAgent(msg.call_id, args.question || "", {
+          intent_type: typeof args.intent_type === "string" ? args.intent_type : null,
+          freshness_required: typeof args.freshness_required === "boolean" ? args.freshness_required : null,
+        });
       } else {
         sendFunctionOutput(msg.call_id, JSON.stringify({ error: `unknown tool ${name}` }));
       }
@@ -891,15 +898,23 @@ function sendFunctionOutput(call_id, output) {
 // Spawn an agent task on the server and long-poll until done. Survives
 // backgrounding -- if the browser tab dies, the task keeps running on the
 // server and the answer is replayed via /api/resume's `completed_while_away`.
-async function handleAskAgent(callId, question) {
+async function handleAskAgent(callId, question, routing) {
   let taskId = null;
   let answer = "";
+  const intentType = routing && typeof routing.intent_type === "string" ? routing.intent_type : null;
+  const freshnessRequired = routing && typeof routing.freshness_required === "boolean" ? routing.freshness_required : null;
   appendBubble("tool", `→ ${question}`);
   try {
     const spawn = await fetch("/api/ask-agent", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ conv_id: convId, question, call_id: callId }),
+      body: JSON.stringify({
+        conv_id: convId,
+        question,
+        call_id: callId,
+        intent_type: intentType,
+        freshness_required: freshnessRequired,
+      }),
     });
     const spawnData = await spawn.json();
     taskId = spawnData.task_id || null;

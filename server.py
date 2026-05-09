@@ -32,7 +32,7 @@ HERE = Path(__file__).parent
 load_dotenv(HERE / ".env")
 
 from auth import tailnet_middleware  # noqa: E402
-from events import log_call_event  # noqa: E402
+from events import log_call_event, compute_routing_metrics  # noqa: E402
 from transcripts import write_transcript, ingest_into_agent, post_to_slack  # noqa: E402
 
 LOG_DIR = HERE / "logs"
@@ -154,9 +154,11 @@ ASK_AGENT_TOOL_SCHEMA = {
     "type": "function",
     "name": "ask_agent",
     "description": (
-        "Consult your agent for memory, calendar, email, projects, drafting, "
-        "research, or any substantive question. Use for everything that isn't "
-        "small talk."
+        "Consult the backend agent for context you don't already have from "
+        "this call: external/current facts (calendar, email, files, web), "
+        "cross-session memory, verification, drafting, or novel reasoning. "
+        "Do NOT call for clarifications, recaps, comparisons, or refinements "
+        "of context already in this call - answer those directly."
     ),
     "parameters": {
         "type": "object",
@@ -167,9 +169,27 @@ ASK_AGENT_TOOL_SCHEMA = {
                     "The question or request to send to the agent, in full natural "
                     "language. Include relevant context from the conversation."
                 ),
-            }
+            },
+            "intent_type": {
+                "type": "string",
+                "enum": ["lookup", "action", "drafting", "reasoning", "verification", "other"],
+                "description": (
+                    "Why you are escalating: lookup (memory/calendar/email/files), "
+                    "action (the user wants something done), drafting (write/compose), "
+                    "reasoning (novel multi-step thinking), verification (confirm a "
+                    "fact's freshness or current state), other."
+                ),
+            },
+            "freshness_required": {
+                "type": "boolean",
+                "description": (
+                    "True if the answer must reflect the current external state "
+                    "(today's calendar, latest email, current file contents, etc.). "
+                    "False if a recent cached answer would be acceptable."
+                ),
+            },
         },
-        "required": ["question"],
+        "required": ["question", "intent_type", "freshness_required"],
     },
 }
 
@@ -189,8 +209,11 @@ Your *brain* is consulted via the ask_agent tool, which routes to a backend
 agent loop with full memory, skills, and external integrations.
 
 CRITICAL TOOL-CALL RULES:
-1. For ANY substantive question - calendar, email, memory, projects, drafting,
-   research, anything beyond pure small talk - call ask_agent.
+1. Use the conversation you already have first. If the user's turn can be
+   fully answered from a prior ask_agent answer in this same call, or is a
+   clarification, recap, comparison, or refinement of context already
+   established here, answer directly without calling ask_agent. The prior
+   tool answers are in your context window - use them.
 2. During an ask_agent call you may say one short bridging line ("one sec",
    "looking now") if the wait is going long. If the wait exceeds ~25 seconds,
    drop another brief "still working on it" beat every 20-30 seconds so the
@@ -199,8 +222,13 @@ CRITICAL TOOL-CALL RULES:
 3. After the tool result arrives, speak the answer naturally and briefly.
    Phone-call tempo: <=2 sentences per turn unless asked for more. Numbers
    spoken naturally ("ten thirty", not "10:30 colon zero zero"). No markdown.
-4. If you didn't call ask_agent and the user asks something substantive,
-   you'll be wrong. Trust the brain. Default to consulting.
+4. Call ask_agent when the answer requires anything you do NOT already have
+   from this call: external/current facts (calendar, email, files, web),
+   cross-session memory ("what did we say last time"), verification of
+   freshness, drafting that needs durable voice, novel reasoning that
+   benefits from the agent's skills, or any user-specific fact not yet
+   established here. Never fabricate user-specific facts - if unsure
+   whether your context covers it, escalate.
 
 ANSWER-QUALITY RULES:
 5. If you don't have the info or aren't confident, say so directly. "I don't
@@ -486,6 +514,9 @@ async def ask_agent(request: web.Request) -> web.Response:
     conv_id = body.get("conv_id")
     question = (body.get("question") or "").strip()
     realtime_call_id = body.get("call_id")
+    # Routing telemetry the model declares per-call. Phase 0: logged, not branched on.
+    intent_type = (body.get("intent_type") or "unknown").strip() or "unknown"
+    freshness_required = bool(body.get("freshness_required"))
     conv = CONVERSATIONS.get(conv_id) if conv_id else None
     if conv is None:
         return web.json_response({"error": "unknown_conv_id"}, status=400)
@@ -500,8 +531,15 @@ async def ask_agent(request: web.Request) -> web.Response:
 
     _touch(conv)
     task_id = _new_task_id()
-    log.info("ask_agent [%s/%s]: %s", conv_id, task_id, question[:120])
-    log_call_event(LOG_DIR, conv_id, "ask_agent_spawned", task_id=task_id, chars=len(question))
+    prior_ask_count = sum(1 for e in conv["entries"] if e.get("role") == "tool_question")
+    log.info("ask_agent [%s/%s] (%s, fresh=%s): %s",
+             conv_id, task_id, intent_type, freshness_required, question[:120])
+    log_call_event(
+        LOG_DIR, conv_id, "ask_agent_spawned",
+        task_id=task_id, chars=len(question),
+        intent_type=intent_type, freshness_required=freshness_required,
+        prior_ask_count=prior_ask_count,
+    )
     state = {
         "task_id": task_id,
         "question": question,
@@ -742,7 +780,8 @@ async def end_call(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "noop": "already_ended"})
     cancelled = _cancel_in_flight_tasks(conv)
     all_entries = sorted(conv["entries"] + client_entries, key=lambda e: e.get("ts", 0))
-    path = write_transcript(conv_id, conv["started_at"], all_entries)
+    metrics = compute_routing_metrics(LOG_DIR, conv_id)
+    path = write_transcript(conv_id, conv["started_at"], all_entries, metrics=metrics)
     ended_at = time.time()
     asyncio.create_task(ingest_into_agent(
         conv_id, all_entries,
@@ -764,6 +803,9 @@ async def end_call(request: web.Request) -> web.Response:
         LOG_DIR, conv_id, "ended",
         reason=reason, duration_s=int(ended_at - conv["started_at"]),
         cancelled_tasks=cancelled, slack_posted=slack_posted,
+        ask_agent_count=metrics["ask_agent_count"],
+        local_answer_turns=metrics["local_answer_turns"],
+        ask_ratio=metrics["ask_ratio"],
     )
     return web.json_response({"ok": True, "transcript": str(path)})
 
@@ -804,8 +846,9 @@ async def _reap_stale_conversations() -> None:
             cancelled = _cancel_in_flight_tasks(conv)
             ended_at = time.time()
             all_entries = sorted(conv.get("entries", []), key=lambda e: e.get("ts", 0))
+            metrics = compute_routing_metrics(LOG_DIR, cid)
             try:
-                write_transcript(cid, conv["started_at"], all_entries)
+                write_transcript(cid, conv["started_at"], all_entries, metrics=metrics)
             except Exception:  # noqa: BLE001
                 log.exception("reap: write_transcript failed for %s", cid)
             slack_posted = False
@@ -824,6 +867,9 @@ async def _reap_stale_conversations() -> None:
                 LOG_DIR, cid, "reaped",
                 reason="idle_timeout", duration_s=int(ended_at - conv["started_at"]),
                 cancelled_tasks=cancelled, slack_posted=slack_posted,
+                ask_agent_count=metrics["ask_agent_count"],
+                local_answer_turns=metrics["local_answer_turns"],
+                ask_ratio=metrics["ask_ratio"],
             )
 
 

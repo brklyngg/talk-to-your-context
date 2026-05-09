@@ -53,15 +53,23 @@ def _session_platform(entries: List[Dict[str, Any]]) -> str:
     return "unknown"
 
 
-def write_transcript(conv_id: str, started_at: float, entries: List[Dict[str, Any]]) -> Path:
+def write_transcript(
+    conv_id: str,
+    started_at: float,
+    entries: List[Dict[str, Any]],
+    *,
+    metrics: Dict[str, Any] | None = None,
+) -> Path:
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     path = TRANSCRIPT_DIR / f"{conv_id}.json"
-    payload = {
+    payload: Dict[str, Any] = {
         "conv_id": conv_id,
         "started_at": started_at,
         "ended_at": time.time(),
         "entries": entries,
     }
+    if metrics:
+        payload["metrics"] = metrics
     path.write_text(json.dumps(payload, indent=2))
     log.info("wrote transcript %s (%d entries)", path, len(entries))
     return path
