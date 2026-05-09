@@ -35,44 +35,44 @@ node --check web/app.js
 ## Architecture (the parts that span multiple files)
 
 **Three layers:**
-1. **Browser client** (`web/app.js`, vanilla JS, no build step). Holds the WebRTC peer to OpenAI Realtime, the mic stream, the brown-noise icebreaker comfort bed, and all client-side continuity state. Loaded directly via `index.html`.
-2. **Sidecar** (`server.py`, aiohttp). Mints Realtime ephemeral sessions, owns the `CONVERSATIONS` in-memory dict, runs `ask_agent` tasks, exposes the resume/premint/handoff endpoints, persists transcripts.
-3. **Agent backend** (external). Reached via `AGENT_API_BASE` (default `http://127.0.0.1:8642`). Speaks an OpenAI-style chat-completions SSE protocol. The sidecar streams `_agent_chat()` against it. Bring your own.
+1. **Browser client** (`web/app.js`, vanilla JS, no build step). Holds the WebRTC peer to OpenAI Realtime, the mic stream, the brown-noise icebreaker (used **only** for cap-swap and forced-reconnect — not for in-call tool waits), and forced-reconnect continuity state. Loaded directly via `index.html`.
+2. **Sidecar** (`server.py`, aiohttp). Mints Realtime ephemeral sessions, owns the `CONVERSATIONS` in-memory dict, synchronously forwards `ask_agent` to the agent backend, exposes the resume/premint/handoff endpoints, persists transcripts.
+3. **Agent backend** (external). Reached via `AGENT_API_BASE` (default `http://127.0.0.1:8642`). Speaks OpenAI-style chat-completions SSE. The sidecar streams `_agent_chat()` against it. Bring your own. (Phase 2: this contract migrates to remote MCP via Tailscale Funnel.)
 
-**`ask_agent` flow (the core loop):**
+**`ask_agent` flow (post-cutover, May 2026):**
 - Realtime emits a `function_call` for `ask_agent` over the data channel.
-- Tool args carry routing telemetry: `intent_type` (lookup/action/drafting/reasoning/verification/other) and `freshness_required` bool. The model is told to answer locally from prior `ask_agent` output for clarifications/recaps/comparisons/refinements; only escalate when external/current/cross-session context is genuinely needed. Both fields are logged, not branched on — see `events.py:compute_routing_metrics`.
-- Client POSTs `/api/ask-agent` → server spawns an async task (`_run_agent_task`), returns either inline answer (fast path, ≤1.5s) or `{status: "running", task_id}`.
-- Client long-polls `/api/agent-task/{task_id}` (25s windows) and feeds the answer back via `sendFunctionOutput()`.
-- Server-side task survives client disconnect; `delivered_to_realtime` flag tracks claim state.
+- Tool args carry routing telemetry: `intent_type` (lookup/action/drafting/reasoning/verification/other) and `freshness_required` bool. The model is told to answer in-session for clarifications/recaps/comparisons/refinements; only escalate when external/current/cross-session context is genuinely needed. Both fields are logged, not branched on — see `events.py:compute_routing_metrics`.
+- Client POSTs `/api/ask-agent` → server forwards synchronously to the backend → returns the answer inline. No task IDs, no long-poll, no fast-path machinery. gpt-realtime-2's native preambles + async function calling keep the conversation flowing through the wait.
+- The client renders a subtle "Consulting deep context: [topic]" status chip on the assistant's bubble while the call is in flight. Phrasing describes the action, not the architecture (no "asking your brain" / "calling the agent" framing — exposing the split-brain seam is bad UX).
+- Total wait capped by `ASK_AGENT_TIMEOUT_SEC` (default 90s). Failures surface via the `_AGENT_UNREACHABLE_SENTINEL` envelope so prompt rule #10 fires.
 
 **Forced-reconnect continuity machinery (load-bearing, non-obvious):**
-Realtime sessions hard-die at the 60-min cap; mobile resumes (visibility, network blip, silent freeze, `session_expired`) all funnel through `triggerResume` → `/api/resume`. Without intervention, the new session is amnesic. Three mechanisms preserve continuity:
+Realtime sessions hard-die at the 60-min cap; mobile resumes (visibility, network blip, silent freeze, `session_expired`) all funnel through `triggerResume` → `/api/resume`. Without intervention, the new session is amnesic. Two mechanisms preserve continuity:
 
-1. **Handoff note** — at any forced teardown, the dying Realtime model writes an ≤80-word continuation note for its successor (text-only response, 2.5s deadline, partial-buffer fallback). Persisted via `POST /api/handoff-note`. Client helper: `requestHandoffNote()`. Server handler: `handoff_note`.
-2. **Recent-entries replay** — `/api/resume` returns the last ~3K tokens of `conv["entries"]` with role normalization (`user_text`/`tool_question` → `user`, etc.). Client replays as `conversation.item.create` items in `onDcOpen` *before* the existing `completed_while_away` loop so `task_id` dedupe runs first. Server helper: `_recent_entries`. Single source of truth: the `instructions` patch + replay; the heuristic primer is **skipped** when `handoff_note` is present.
-3. **60-min cap pre-mint + brown-noise bridge** — at 58:30 the client POSTs `/api/premint-session` to cache a fresh ephemeral; cap-swap fires at `min(59:00, expires_at − 10s)` and reuses the existing `/api/resume` to claim missed work. The `icebreaker` (procedural brown noise via WebAudio) fades in *before* peer teardown and out only after `pc.ontrack` first audio frame on the new peer. Client helpers: `schedulePremint`, `doPremint`, `gracefulCapSwap`, `endIcebreaker`.
+1. **Handoff note** — at any forced teardown, the dying Realtime model writes an ≤80-word continuation note for its successor (text-only response, 3.5s deadline, partial-buffer fallback). Persisted via `POST /api/handoff-note`. Client helper: `requestHandoffNote()`. On resume, the server bakes the note into the freshly-minted ephemeral's `instructions` via `_mint_realtime_session(instructions_suffix=…)`. Client `onDcOpen` then echoes the assembled `instructions` + `tools` back via `session.update` as defense against the documented `gpt-realtime` tools-drop quirk (`gpt-realtime-2` GA may have fixed it; kept as belt-and-suspenders).
+2. **60-min cap pre-mint + brown-noise bridge** — at 58:30 the client POSTs `/api/premint-session` to cache a fresh ephemeral; cap-swap fires at `min(59:00, expires_at − 10s)` and reuses `/api/resume`. The `icebreaker` (procedural brown noise via WebAudio) fades in *before* peer teardown and out only after `pc.ontrack` first audio frame on the new peer. Client helpers: `schedulePremint`, `doPremint`, `gracefulCapSwap`, `endIcebreaker`.
+
+(Recent-entries replay was removed in the May 2026 cutover — gpt-realtime-2's 128K context + handoff-note-baked-into-instructions is sufficient. Reintroduce a thin version only if NDJSON shows continuity gaps post-deploy.)
 
 **Concurrency hazards already handled:**
 - `responseInFlight` tracking + dedicated `response.text.delta`/`done` cases gate handoff-note requests (Realtime allows only one response at a time).
-- `pollAbortGen` counter (bumped in `triggerResume`) lets in-flight `pollAgentTask` loops bound to dead `call_id`s self-terminate; resume's `still_working` list re-attaches them with `callId=null`.
-- `activeToolCalls = 0` reset on resume prevents zombie counter from hiding the icebreaker mid-answer.
 - Mute state preserved across resume by re-applying `track.enabled = false` after `attachPeer` adds tracks to the new peer.
 
 ## Key files
 
-- `server.py` — sidecar; all server-side endpoints (`/api/session`, `/api/ask-agent`, `/api/agent-task/{task_id}`, `/api/text-turn`, `/api/resume`, `/api/premint-session`, `/api/handoff-note`, `/api/end`, `/api/client-event`, `/api/health`).
-- `web/app.js` — browser client; WebRTC peer + dc message switch (`onDcMessage`), `attachPeer`, `onDcOpen`, `triggerResume`, `gracefulCapSwap`, `cleanupCall`.
-- `events.py` — append-only NDJSON per-call event logger (`log_call_event`).
+- `server.py` — sidecar; endpoints (`/api/session`, `/api/ask-agent`, `/api/text-turn`, `/api/resume`, `/api/premint-session`, `/api/handoff-note`, `/api/end`, `/api/client-event`, `/api/health`).
+- `web/app.js` — browser client; WebRTC peer + dc message switch (`onDcMessage`), `attachPeer`, `onDcOpen`, `triggerResume`, `gracefulCapSwap`, `cleanupCall`, `showConsultingChip`/`updateConsultingChip` (status indicator), markdown renderer for displayed tool-answer bubbles.
+- `events.py` — append-only NDJSON per-call event logger (`log_call_event`); `compute_routing_metrics` derives ask_agent count vs in-session local-answer turns.
 - `transcripts.py` — end-of-call transcript persistence + optional Slack archive.
 - `auth.py` — request auth + CIDR allowlist enforcement.
 
 ## Style
 
 - Conventional commits (`feat:`, `fix:`, `refactor:`, `docs:`, `chore:`).
-- `cleanupCall()` is for **true end** only. Forced reconnects must NOT call it — they need to preserve `convId`, `clientEntries`, `deliveredTaskIds`, the icebreaker, and the AudioContext across the gap. The dedicated `endIcebreaker()` helper exists so the resume path doesn't accidentally close the AudioContext.
-- `voice` is **locked** after the first audio response. Never re-send it on `session.update` — doing so tears the session down. The `sessionPatch` builder in `onDcOpen` already omits it.
+- `cleanupCall()` is for **true end** only. Forced reconnects must NOT call it — they need to preserve `convId`, `clientEntries`, the icebreaker, and the AudioContext across the gap. The dedicated `endIcebreaker()` helper exists so the resume path doesn't accidentally close the AudioContext.
+- `voice` is **locked** after the first audio response. Never re-send it on `session.update` — doing so tears the session down.
 - The `ask_hermes` legacy tool name path exists for back-compat with cached PWA installs. Don't remove without a migration plan.
+- **UX language: describe the action, not the architecture.** Tool-call indicators describe what's happening for the user ("Consulting deep context") — never how the system is doing it ("asking your brain" / "calling the agent"). The split-brain design is an implementation detail; users see a single colleague.
 
 ## Security boundaries
 

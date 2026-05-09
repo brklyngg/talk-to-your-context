@@ -1,3 +1,7 @@
+> **SUPERSEDED — 2026-05-09.** The running-log middle-layer concept proposed below is largely obsoleted by the `gpt-realtime-2` cutover (May 7, 2026 GA: GPT-5-class reasoning, 128K context). The Realtime model now maintains its own working state in-context across long calls, and a tighter system prompt + `intent_type`/`freshness_required` telemetry already biases it toward in-session answers without a separate session-level memory layer. **Preserved as historical context** — re-evaluate only if `compute_routing_metrics` (`events.py`) shows the post-cutover ask-ratio holding stubbornly high (>50% on substantive turns). See `docs/ARCHITECTURE.md` for the current architecture and `.claude/plans/` for the cutover plan.
+
+---
+
 # Claude Code Handoff: Reduce Deep-Context Call Frequency with an Optimized Running Log
 
 **Created:** 2026-05-05 09:40 EDT  
