@@ -21,12 +21,13 @@ let convId = null;
 let started = false;
 let micMuted = false;
 let audioCtx = null;
-let icebreaker = null;     // {fadeIn, fadeOut, dispose} — restored as a comfort
-                           // signal during ask_agent waits. Defaults to procedural
-                           // brown noise; transparently swaps to /static/ambient.mp3
-                           // (Suno track) when present and idle.
+let icebreaker = null;     // {fadeIn, fadeOut, dispose} — comfort bed for the
+                           // peerless gap during cap-swap and forced-reconnect.
+                           // Scope shrunk in May 2026: gpt-realtime-2's native
+                           // preambles + async function calling fill in-call
+                           // tool waits, so the icebreaker no longer fires on
+                           // ask_agent — only when we genuinely have no peer.
 let ambientBuffer = null;  // decoded AudioBuffer cached when /static/ambient.mp3 served
-let activeToolCalls = 0;
 const clientEntries = [];  // {role, text, ts, latencyMs?} for end-of-call upload
 let pendingAssistantBubble = null;
 const turnTiming = { userDoneTs: null, firstTokenTs: null };
@@ -36,16 +37,15 @@ let connDownSinceTs = null;
 let resumeInFlight = false;
 let watchdogTimer = null;
 
-// Tasks delivered to the realtime peer; dedupe stale long-polls vs resume payloads.
-const deliveredTaskIds = new Set();
-
-// Last minted/resumed session config; echoed via session.update on dc-open so
-// the model definitively sees instructions+tools (ephemeral-mint config alone
-// is silently dropped by gpt-realtime in some flows).
+// Last minted/resumed session config; echoed via session.update on dc-open as
+// defensive insurance against the documented `gpt-realtime` tools-drop quirk
+// where tools registered at ephemeral-mint are silently lost in some flows.
+// gpt-realtime-2 GA may have fixed this — kept as a belt-and-suspenders
+// defense since the cost of being wrong is "ask_agent never fires."
+// The handoff-note continuation suffix is baked into the server-minted
+// instructions, so we just echo whatever the server gave us — no client-side
+// concatenation needed.
 let lastSessionConfig = null;
-// Whether the current realtime response window contained a function_call.
-// Reset on response.done so client_response_done can report it accurately.
-let hadFunctionCallThisResponse = false;
 
 // --- Forced-reconnect continuity state ---
 // `responseInFlight` flips on response.created and back on response.done. The
@@ -56,9 +56,6 @@ let responseInFlight = false;
 // `responseId` is null until response.created arrives, then bound to the real id
 // so subsequent response.text.delta events route to the right buffer.
 let activeHandoffRequest = null;
-// Bumped whenever we tear down the peer for resume; in-flight pollAgentTask
-// loops capture this generation at start and short-circuit if it changes.
-let pollAbortGen = 0;
 // Set true when the new peer's audio track first emits frames (pc.ontrack).
 // Drives the brown-noise fade-out timing on resume.
 let firstAudioFrameSeen = false;
@@ -70,6 +67,11 @@ let premintedSession = null;
 let premintedExpiresAt = null;
 let premintTimer = null;
 let capSwapTimer = null;
+
+// Active tool-call status chips on the assistant's bubble. call_id -> {chipDiv, throttled}.
+// Phrasing describes the action ("Consulting deep context: …"); never references
+// "brain", "model", or "agent" — exposing the split-brain seam is bad UX.
+const consultingChips = new Map();
 
 function logClientEvent(event, payload = {}) {
   if (!convId) return;
@@ -108,7 +110,43 @@ function composeMetaLabel(meta) {
   return parts.join(" · ");
 }
 
-function appendBubble(role, text, meta) {
+// Tiny markdown renderer for displayed tool-answer bubbles. Supports lists,
+// code spans, links, bold, italics, and line breaks — nothing else. Voice
+// answers stay plain (the model's "no markdown" rule applies to spoken text).
+function renderInlineMarkdown(text) {
+  let out = String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1<em>$2</em>");
+  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return out;
+}
+function renderMarkdown(text) {
+  if (!text) return "";
+  const lines = String(text).split("\n");
+  const out = [];
+  let inList = false;
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    const liMatch = line.match(/^\s*(?:[-*]|\d+\.)\s+(.*)/);
+    if (liMatch) {
+      if (!inList) { out.push("<ul>"); inList = true; }
+      out.push(`<li>${renderInlineMarkdown(liMatch[1])}</li>`);
+    } else {
+      if (inList) { out.push("</ul>"); inList = false; }
+      if (line) out.push(`<div>${renderInlineMarkdown(line)}</div>`);
+      else out.push("<br>");
+    }
+  }
+  if (inList) out.push("</ul>");
+  return out.join("");
+}
+
+function appendBubble(role, text, meta, opts) {
   const div = document.createElement("div");
   div.className = "bubble " + role;
   const metaEl = document.createElement("div");
@@ -118,7 +156,8 @@ function appendBubble(role, text, meta) {
   if (!label) metaEl.style.display = "none";
   const textEl = document.createElement("div");
   textEl.className = "bubble-text";
-  textEl.textContent = text;
+  if (opts && opts.renderMd) textEl.innerHTML = renderMarkdown(text);
+  else textEl.textContent = text;
   div.appendChild(metaEl);
   div.appendChild(textEl);
   div._textEl = textEl;
@@ -127,6 +166,47 @@ function appendBubble(role, text, meta) {
   transcriptEl.appendChild(div);
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
   return div;
+}
+
+// --------------- Consulting status chip ---------------
+// Subtle status indicator while the model is consulting deep context. Phrasing
+// describes the action — never the architecture. The streaming args delta lets
+// us live-render the topic as it forms, then freeze on .done, then fade when
+// the answer arrives.
+function showConsultingChip() {
+  const div = document.createElement("div");
+  div.className = "bubble consulting";
+  div.style.opacity = "0.72";
+  const textEl = document.createElement("div");
+  textEl.className = "bubble-text";
+  textEl.style.fontStyle = "italic";
+  textEl.style.fontSize = "0.92em";
+  textEl.textContent = "Consulting deep context…";
+  div.appendChild(textEl);
+  div._textEl = textEl;
+  transcriptEl.appendChild(div);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  return div;
+}
+function updateConsultingChip(div, topic) {
+  if (!div || !div._textEl) return;
+  const t = (topic || "").trim();
+  div._textEl.textContent = t ? `Consulting deep context: ${t}` : "Consulting deep context…";
+}
+function fadeOutConsultingChip(div) {
+  if (!div) return;
+  div.style.transition = "opacity 0.4s";
+  div.style.opacity = "0";
+  setTimeout(() => { try { div.remove(); } catch {} }, 500);
+}
+// Pull the question value from a partial JSON args buffer. Args stream in
+// before the .done event, and partial JSON can't be parsed, so we extract
+// the in-progress "question" string directly.
+function extractStreamingQuestion(argsBuffer) {
+  if (!argsBuffer) return null;
+  const m = argsBuffer.match(/"question"\s*:\s*"((?:[^"\\]|\\.)*)/);
+  if (!m) return null;
+  return m[1].replace(/\\n/g, " ").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
 }
 
 function setBubbleText(div, text) {
@@ -212,7 +292,7 @@ function createSampleIcebreaker(ctx, buffer) {
 
 function maybeSwapToSampleIcebreaker() {
   if (!audioCtx || !ambientBuffer || !icebreaker) return;
-  if (activeToolCalls !== 0) return;  // bed is currently faded in; defer
+  if (resumeInFlight) return;  // bed may be faded in during cap-swap/resume; defer
   const old = icebreaker;
   icebreaker = createSampleIcebreaker(audioCtx, ambientBuffer);
   old.dispose();
@@ -342,25 +422,16 @@ async function startCall() {
 }
 
 function onDcOpen(resumeContext) {
-  // Re-assert session config over the data channel. Tools registered only at
-  // ephemeral-mint time are silently dropped by gpt-realtime in some flows
-  // (documented community pattern); session.update on dc-open is the canonical
-  // fix. NOTE: omit `voice` -- it is locked after first audio response and
-  // including it on resume tears the session down. Strip nulls (the mint
-  // endpoint accepts null fields like input_audio_transcription.language but
-  // session.update rejects them as invalid_type).
+  // Re-assert session config over the data channel as defense against the
+  // documented `gpt-realtime` tools-drop quirk (tools silently lost in some
+  // flows). gpt-realtime-2 GA may have fixed this; kept as belt-and-suspenders
+  // since the cost of being wrong is "ask_agent never fires."
+  // NOTE: omit `voice` — it is locked after first audio response and including
+  // it on resume tears the session down. Strip nulls (mint accepts null
+  // input_audio_transcription.language but session.update rejects it).
+  // The handoff-note continuation is baked into cfg.instructions server-side
+  // via _mint_realtime_session(instructions_suffix=...) — we just echo it back.
   const cfg = lastSessionConfig || {};
-  // Append handoff-note continuation suffix into instructions BEFORE building
-  // the session.update patch -- single source of truth for resume continuity.
-  let resumeInstructions = cfg.instructions;
-  if (resumeContext?.handoff_note) {
-    resumeInstructions = (cfg.instructions || "") +
-      "\n\nContinuation context from earlier in this same call: " +
-      resumeContext.handoff_note +
-      "\n\nCritical: do not greet, do not acknowledge any pause, do not say " +
-      "'as I was saying' or similar filler. Continue exactly where you left " +
-      "off in topic and tone. Wait for the user's next utterance before responding.";
-  }
   if (cfg.tools || cfg.instructions) {
     const stripNulls = (obj) => {
       if (!obj || typeof obj !== "object") return obj;
@@ -372,7 +443,7 @@ function onDcOpen(resumeContext) {
     };
     const sessionPatch = {
       modalities: cfg.modalities || ["audio", "text"],
-      instructions: resumeInstructions,
+      instructions: cfg.instructions,
       tools: cfg.tools || [],
       tool_choice: cfg.tool_choice || "auto",
       turn_detection: cfg.turn_detection,
@@ -387,11 +458,10 @@ function onDcOpen(resumeContext) {
   logClientEvent("client_dc_opened", {
     tools_in_session: (cfg.tools || []).map((t) => t.name),
     tool_choice: cfg.tool_choice || null,
-    instructions_chars: (resumeInstructions || "").length,
+    instructions_chars: (cfg.instructions || "").length,
     resume: !!resumeContext,
     session_update_sent: !!(cfg.tools || cfg.instructions),
     handoff_note_chars: (resumeContext?.handoff_note || "").length,
-    recent_entries: (resumeContext?.recent_entries || []).length,
   });
 
   if (!resumeContext) {
@@ -401,58 +471,8 @@ function onDcOpen(resumeContext) {
     });
     return;
   }
-  // Replay recent transcript as conversation history BEFORE the completed-loop
-  // dedupe reads `deliveredTaskIds`. This restores the surrounding chitchat
-  // context so the model isn't amnesic about topic and tone.
-  const recent = resumeContext.recent_entries || [];
-  for (const entry of recent) {
-    if (entry.task_id) deliveredTaskIds.add(entry.task_id);
-    if (entry.role !== "user" && entry.role !== "assistant") continue;
-    send({
-      type: "conversation.item.create",
-      item: {
-        type: "message", role: entry.role,
-        content: [{ type: entry.role === "user" ? "input_text" : "text", text: entry.text }],
-      },
-    });
-  }
-  if (recent.length) {
-    logClientEvent("client_resume_transcript_replayed", { count: recent.length });
-  }
-  // Resume path: replay any answers the user missed as a normal user/assistant
-  // pair (NOT function_call_output -- the call_id belonged to the dead session
-  // and Realtime would reject it).
-  const completed = resumeContext.completed_while_away || [];
-  for (const item of completed) {
-    if (deliveredTaskIds.has(item.task_id)) continue;
-    deliveredTaskIds.add(item.task_id);
-    send({
-      type: "conversation.item.create",
-      item: { type: "message", role: "user", content: [{ type: "input_text", text: `(replayed from before the pause) ${item.question}` }] },
-    });
-    send({
-      type: "conversation.item.create",
-      item: { type: "message", role: "assistant", content: [{ type: "text", text: item.answer }] },
-    });
-    appendBubble("tool", `↻ carried over: ${item.question}`);
-    appendBubble("tool", `← ${item.answer}`);
-  }
-  // When handoff_note is present, the instructions suffix carries the full
-  // continuity signal. Skip the heuristic primer + response.create entirely;
-  // semantic_vad will trigger the next response on the user's next utterance.
-  if (!resumeContext.handoff_note) {
-    let primer;
-    if (completed.length > 0) {
-      primer = "User just got back from a brief pause. The agent finished work while they were away. Greet them in one short sentence and offer to walk through the answer(s).";
-    } else {
-      primer = "User just got back from a brief pause. Greet them in one short sentence and continue naturally.";
-    }
-    send({
-      type: "conversation.item.create",
-      item: { type: "message", role: "system", content: [{ type: "input_text", text: primer }] },
-    });
-    send({ type: "response.create" });
-  }
+  // Resume path: handoff-note instructions suffix carries continuity. semantic_vad
+  // triggers the next response on the user's next utterance — no primer needed.
   // Brown-noise bridge fade-out: poll for first audio frame, fade when seen.
   // Hard cap at 5s so we don't keep the bed playing if no audio ever arrives.
   if (icebreaker) {
@@ -468,16 +488,7 @@ function onDcOpen(resumeContext) {
       }
     }, 100);
   }
-
-  // Reattach long-polls for tasks that are still running on the server.
-  const stillWorking = resumeContext.still_working || [];
-  for (const t of stillWorking) {
-    if (deliveredTaskIds.has(t.task_id)) continue;
-    appendBubble("tool", `🧠 still working on: ${t.question} (${t.elapsed_s}s)`);
-    pollAgentTask(null, t.task_id, t.question);
-  }
-
-  appendBubble("system", `↻ Resumed${completed.length ? ` · ${completed.length} answer(s) ready` : ""}${stillWorking.length ? ` · ${stillWorking.length} still working` : ""}`);
+  appendBubble("system", "↻ Resumed");
 }
 
 // --------------- Connection monitoring (5G <-> wifi, backgrounding) ---------------
@@ -560,11 +571,14 @@ async function requestHandoffNote(reason) {
     logClientEvent("client_handoff_note_failed", { reason, error: String(e) });
     return null;
   }
-  // Race the model's response against a 2.5s deadline. On timeout, use whatever
-  // partial buffer we accumulated -- a half-formed note still beats nothing.
+  // Race the model's response against a 3.5s deadline (bumped from 2.5s for
+  // gpt-realtime-2: GPT-5-class reasoning + 128K context lets the model write
+  // a richer note when given the headroom). On timeout, use whatever partial
+  // buffer we accumulated — a half-formed note still beats nothing.
+  const HANDOFF_DEADLINE_MS = 3500;
   const note = await Promise.race([
     donePromise,
-    new Promise((r) => setTimeout(() => r(activeHandoffRequest?.buffer || null), 2500)),
+    new Promise((r) => setTimeout(() => r(activeHandoffRequest?.buffer || null), HANDOFF_DEADLINE_MS)),
   ]);
   const ms = Math.round(performance.now() - t0);
   activeHandoffRequest = null;
@@ -577,7 +591,7 @@ async function requestHandoffNote(reason) {
     }).catch(() => {});
     logClientEvent("client_handoff_note_generated", { reason, chars: trimmed.length, generated_in_ms: ms });
   } else {
-    logClientEvent("client_handoff_note_failed", { reason, deadline_ms: 2500, generated_in_ms: ms });
+    logClientEvent("client_handoff_note_failed", { reason, deadline_ms: HANDOFF_DEADLINE_MS, generated_in_ms: ms });
   }
   return trimmed || null;
 }
@@ -644,10 +658,8 @@ async function gracefulCapSwap() {
   try {
     if (icebreaker) try { icebreaker.fadeIn(); } catch {}
     await requestHandoffNote("session_cap");
-    pollAbortGen++;
-    activeToolCalls = 0;
-    // Claim missed work via a regular /api/resume call (this also marks any
-    // completed_while_away tasks delivered, so no double-replay).
+    // Claim continuity (handoff note baked into instructions server-side) via
+    // the regular /api/resume call.
     const r = await fetch("/api/resume", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -663,10 +675,17 @@ async function gracefulCapSwap() {
     }
     if (dc) { try { dc.close(); } catch {} dc = null; }
     if (pc) { try { pc.close(); } catch {} pc = null; }
-    // Use the pre-minted session for transport, but resume context (handoff
-    // note, recent_entries, completed_while_away, still_working) from claim.
-    const transport = { ...claim, session: premintedSession.session };
-    lastSessionConfig = premintedSession.session;
+    // Transport from the pre-minted session; handoff_note/instructions already
+    // baked into claim.session.instructions server-side. NOTE: the pre-minted
+    // session was minted *before* the handoff note existed, so its instructions
+    // lack the continuation suffix. Use claim.session.instructions instead so
+    // session.update echoes the right text.
+    const mergedSession = {
+      ...premintedSession.session,
+      instructions: claim.session?.instructions || premintedSession.session.instructions,
+    };
+    const transport = { ...claim, session: mergedSession };
+    lastSessionConfig = mergedSession;
     premintedSession = null;
     premintedExpiresAt = null;
     await attachPeer(transport, claim);
@@ -690,15 +709,10 @@ async function triggerResume(reason, { silent = false } = {}) {
   if (icebreaker) try { icebreaker.fadeIn(); } catch {}
   try {
     // Generate a continuation note while the dying dc is still open. Best
-    // effort -- bounded by 2.5s and gated on responseInFlight.
+    // effort — bounded by the handoff deadline and gated on responseInFlight.
     await requestHandoffNote(reason);
-    // Abort any in-flight pollAgentTask loops bound to the dying call_ids;
-    // /api/resume's still_working list will re-attach them with callId=null.
-    pollAbortGen++;
-    activeToolCalls = 0;
-    // Tear down the dead peer (don't call cleanupCall -- we want to keep
-    // started=true, clientEntries, deliveredTaskIds, and the icebreaker bed
-    // intact across the gap).
+    // Tear down the dead peer (don't call cleanupCall — we want to keep
+    // started=true, clientEntries, and the icebreaker bed intact across the gap).
     if (dc) { try { dc.close(); } catch {} dc = null; }
     if (pc) { try { pc.close(); } catch {} pc = null; }
     const r = await fetch("/api/resume", {
@@ -815,14 +829,13 @@ function onDcMessage(ev) {
       const item = msg.item || {};
       if (item.type === "function_call") {
         fnCallBuffers.set(item.call_id, { name: item.name, args: "" });
-        hadFunctionCallThisResponse = true;
         logClientEvent("client_function_call_arrived", { name: item.name, call_id: item.call_id });
         if (item.name === "ask_agent") {
-          activeToolCalls++;
-          appendBubble("tool", "thinking...");
-          setStatus("agent is thinking...", "thinking");
-          setDot("thinking");
-          if (icebreaker) icebreaker.fadeIn();
+          // Subtle status chip describing the action — phrasing intentionally
+          // hides the split-brain seam (no "asking your brain" / "calling the
+          // agent" framing).
+          const chipDiv = showConsultingChip();
+          consultingChips.set(item.call_id, { chipDiv, throttled: false });
         }
       }
       break;
@@ -831,6 +844,16 @@ function onDcMessage(ev) {
     case "response.function_call_arguments.delta": {
       const buf = fnCallBuffers.get(msg.call_id);
       if (buf) buf.args += msg.delta || "";
+      // Throttle DOM updates via rAF; partial JSON args yield a partial topic.
+      const entry = consultingChips.get(msg.call_id);
+      if (entry && !entry.throttled) {
+        entry.throttled = true;
+        requestAnimationFrame(() => {
+          entry.throttled = false;
+          const topic = extractStreamingQuestion(buf?.args || "");
+          updateConsultingChip(entry.chipDiv, topic);
+        });
+      }
       break;
     }
 
@@ -840,6 +863,9 @@ function onDcMessage(ev) {
       let args = {};
       try { args = JSON.parse(buf?.args || msg.arguments || "{}"); } catch {}
       fnCallBuffers.delete(msg.call_id);
+      // Final, complete topic update on the chip.
+      const entry = consultingChips.get(msg.call_id);
+      if (entry && args.question) updateConsultingChip(entry.chipDiv, args.question);
       if (name === "ask_agent") {
         handleAskAgent(msg.call_id, args.question || "", {
           intent_type: typeof args.intent_type === "string" ? args.intent_type : null,
@@ -854,11 +880,9 @@ function onDcMessage(ev) {
     case "response.done":
       responseInFlight = false;
       logClientEvent("client_response_done", {
-        had_function_call: hadFunctionCallThisResponse,
         response_id: msg.response?.id || null,
         output_item_count: Array.isArray(msg.response?.output) ? msg.response.output.length : null,
       });
-      hadFunctionCallThisResponse = false;
       break;
 
     case "error": {
@@ -895,17 +919,15 @@ function sendFunctionOutput(call_id, output) {
   send({ type: "response.create" });
 }
 
-// Spawn an agent task on the server and long-poll until done. Survives
-// backgrounding -- if the browser tab dies, the task keeps running on the
-// server and the answer is replayed via /api/resume's `completed_while_away`.
+// Synchronous forward to the backend agent. gpt-realtime-2's async function
+// calling keeps the conversation flowing in the audio channel during the
+// wait — no client-side polling, no icebreaker, no in-call status interrupt.
 async function handleAskAgent(callId, question, routing) {
-  let taskId = null;
   let answer = "";
   const intentType = routing && typeof routing.intent_type === "string" ? routing.intent_type : null;
   const freshnessRequired = routing && typeof routing.freshness_required === "boolean" ? routing.freshness_required : null;
-  appendBubble("tool", `→ ${question}`);
   try {
-    const spawn = await fetch("/api/ask-agent", {
+    const r = await fetch("/api/ask-agent", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -916,74 +938,28 @@ async function handleAskAgent(callId, question, routing) {
         freshness_required: freshnessRequired,
       }),
     });
-    const spawnData = await spawn.json();
-    taskId = spawnData.task_id || null;
-    if (spawnData.status && spawnData.status !== "running") {
-      // Inline fast-path -- answer is already here.
-      answer = spawnData.answer || "";
-    } else if (taskId) {
-      answer = await pollAgentTask(callId, taskId, question);
-    } else {
-      answer = spawnData.answer || "(no answer)";
-    }
+    const data = await r.json();
+    answer = data.answer || "";
   } catch (e) {
     answer = `Agent is temporarily unreachable - ${e.message}`;
   } finally {
-    activeToolCalls = Math.max(0, activeToolCalls - 1);
-    if (activeToolCalls === 0) {
-      setStatus("connected", "live");
-      setDot("ok");
-      if (icebreaker) icebreaker.fadeOut();
-      // If the Suno asset finished decoding mid-call, the swap was deferred.
-      // Now that the bed is idle, retry — silent because both sit at gain 0.
-      maybeSwapToSampleIcebreaker();
+    // Fade out the consulting chip; remove from the active map.
+    const entry = consultingChips.get(callId);
+    if (entry) {
+      fadeOutConsultingChip(entry.chipDiv);
+      consultingChips.delete(callId);
     }
   }
-  if (taskId) deliveredTaskIds.add(taskId);
-  // Render answer; flag failures distinctly so Gary can tell at a glance.
-  appendBubble(isErrorAnswer(answer) ? "system" : "tool", `← ${answer || "(no answer)"}`);
+  // Render answer with markdown for tool-answer bubbles. Voice answers stay
+  // plain; this is display-only enrichment.
+  if (isErrorAnswer(answer)) {
+    appendBubble("system", answer || "(no answer)");
+  } else {
+    appendBubble("tool", answer || "(no answer)", null, { renderMd: true });
+  }
   // Always feed something back to the realtime peer so it doesn't hang on the
   // function call. Structured-error sentinel triggers prompt rule #10.
   sendFunctionOutput(callId, answer || "Agent is temporarily unreachable - please ask the user to repeat that.");
-}
-
-// Poll loop reused by handleAskAgent and resume's still_working reattach.
-// callId may be null on resume -- we still update the transcript/UI even when
-// there's no live realtime peer to feed.
-async function pollAgentTask(callId, taskId, question) {
-  // Capture the abort generation at spawn time. triggerResume bumps this
-  // counter so stale polls bound to the dying call_id self-terminate; the
-  // resume's still_working list re-attaches them with callId=null.
-  const myGen = pollAbortGen;
-  while (true) {
-    if (!convId) return "";
-    if (myGen !== pollAbortGen) return "";
-    let data;
-    try {
-      const r = await fetch(`/api/agent-task/${encodeURIComponent(taskId)}?conv_id=${encodeURIComponent(convId)}`);
-      data = await r.json();
-    } catch (e) {
-      // Network blip during long-poll. Brief retry; resume flow handles real failures.
-      await new Promise((res) => setTimeout(res, 1500));
-      continue;
-    }
-    if (data.status === "running") continue;
-    if (myGen !== pollAbortGen) return "";
-    deliveredTaskIds.add(taskId);
-    const answer = data.answer || "";
-    if (callId === null) {
-      // Resume-attached poll: render in transcript and feed to whichever peer
-      // is currently live (if any) as a normal assistant message.
-      appendBubble("tool", `→ (carried over) ${question}`);
-      appendBubble(isErrorAnswer(answer) ? "system" : "tool", `← ${answer || "(no answer)"}`);
-      send({
-        type: "conversation.item.create",
-        item: { type: "message", role: "assistant", content: [{ type: "text", text: answer }] },
-      });
-      send({ type: "response.create" });
-    }
-    return answer;
-  }
 }
 
 // --------------- Mute / End / Text mode ---------------
@@ -1063,7 +1039,11 @@ function cleanupCall() {
   talkBtn.disabled = false;
   setDot("ok");
   clientEntries.length = 0;
-  deliveredTaskIds.clear();
+  // Tear down any open consulting chips (no peer to receive answers anyway).
+  for (const entry of consultingChips.values()) {
+    try { fadeOutConsultingChip(entry.chipDiv); } catch {}
+  }
+  consultingChips.clear();
   turnTiming.userDoneTs = null;
   turnTiming.firstTokenTs = null;
   connDownSinceTs = null;
