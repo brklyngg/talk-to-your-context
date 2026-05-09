@@ -41,6 +41,7 @@ node --check web/app.js
 
 **`ask_agent` flow (the core loop):**
 - Realtime emits a `function_call` for `ask_agent` over the data channel.
+- Tool args carry routing telemetry: `intent_type` (lookup/action/drafting/reasoning/verification/other) and `freshness_required` bool. The model is told to answer locally from prior `ask_agent` output for clarifications/recaps/comparisons/refinements; only escalate when external/current/cross-session context is genuinely needed. Both fields are logged, not branched on — see `events.py:compute_routing_metrics`.
 - Client POSTs `/api/ask-agent` → server spawns an async task (`_run_agent_task`), returns either inline answer (fast path, ≤1.5s) or `{status: "running", task_id}`.
 - Client long-polls `/api/agent-task/{task_id}` (25s windows) and feeds the answer back via `sendFunctionOutput()`.
 - Server-side task survives client disconnect; `delivered_to_realtime` flag tracks claim state.
