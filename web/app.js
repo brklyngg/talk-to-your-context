@@ -738,6 +738,10 @@ function onDcMessage(ev) {
     }
 
     case "response.audio_transcript.delta":
+    case "response.output_audio_transcript.delta":
+      // GA Realtime renamed audio_transcript → output_audio_transcript (same
+      // rename family as response.modalities → response.output_modalities).
+      // Keep the legacy name as a fallback for older session payloads.
       assistantTextBuf += msg.delta || "";
       if (!pendingAssistantBubble) {
         const startedAt = Date.now();
@@ -748,7 +752,8 @@ function onDcMessage(ev) {
       transcriptEl.scrollTop = transcriptEl.scrollHeight;
       break;
 
-    case "response.audio_transcript.done": {
+    case "response.audio_transcript.done":
+    case "response.output_audio_transcript.done": {
       const completedAt = Date.now();
       const userDoneTs = turnTiming.userDoneTs;
       const firstTokenTs = turnTiming.firstTokenTs;
