@@ -48,10 +48,13 @@ logging.basicConfig(
 log = logging.getLogger("ttyc.server")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2")
 OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
 AGENT_API_BASE = os.getenv("AGENT_API_BASE", "http://127.0.0.1:8642").rstrip("/")
-ASK_AGENT_IDLE_TIMEOUT = float(os.getenv("ASK_AGENT_IDLE_TIMEOUT", "45"))
+# Total timeout cap on a single ask_agent forward to the backend. The model's
+# native preambles + async function calling fill any in-call wait; this only
+# bounds the absolute worst case (Hermes hung, network wedged, etc.).
+ASK_AGENT_TIMEOUT_SEC = float(os.getenv("ASK_AGENT_TIMEOUT_SEC", "90"))
 HOST = os.getenv("VOICE_HOST", "127.0.0.1")
 PORT = int(os.getenv("VOICE_PORT", "8090"))
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
@@ -72,30 +75,15 @@ if not OPENAI_API_KEY:
 
 # Active conversations: conv_id -> {
 #   started_at: float, last_activity_ts: float,
-#   entries: [...],
-#   agent_tasks: {task_id: {question, status, answer, started_at,
-#                           finished_at, realtime_call_id,
-#                           delivered_to_realtime: bool, task: asyncio.Task}}
+#   entries: [...],            # transcript items (user/assistant/tool_question/tool_answer)
+#   handoff_note: str?,        # ≤80-word continuation note from a dying session
 # }
 CONVERSATIONS: Dict[str, Dict[str, Any]] = {}
 
-# How long /api/agent-task long-polls before returning (client retries).
-# Bounded below the typical mobile-network/CDN idle timeout.
-AGENT_TASK_LONG_POLL_SEC = 25.0
-# Inline fast-path: if the agent answers within this many seconds, return it
-# in the /api/ask-agent response so the browser never has to long-poll.
-ASK_AGENT_FAST_PATH_SEC = 1.5
-# Cap concurrent in-flight agent tasks per conversation. Realtime model can
-# parallel-call -- bound it so a misbehaving session can't flood.
-MAX_CONCURRENT_AGENT_TASKS = 3
 # Idle-reap window. Backgrounding no longer ends a call, so we use this as
 # the cost guard instead of the prior 65-min started_at ceiling.
 REAPER_INTERVAL_SEC = 60
 REAPER_IDLE_TIMEOUT_SEC = 20 * 60
-
-
-def _new_task_id() -> str:
-    return secrets.token_urlsafe(9)
 
 
 def _touch(conv: Dict[str, Any]) -> None:
@@ -106,48 +94,7 @@ def _ensure_conv_shape(conv: Dict[str, Any]) -> None:
     """Backfill optional keys so existing in-memory conversations from older
     server versions don't KeyError after a code update."""
     conv.setdefault("entries", [])
-    conv.setdefault("agent_tasks", {})
     conv.setdefault("last_activity_ts", conv.get("started_at", time.time()))
-
-
-# Map every entry role we persist into the {user, assistant, system} space the
-# Realtime model accepts on conversation.item.create. Anything not in this map
-# is silently dropped from resume replay (system markers, unknowns, etc.).
-_ENTRY_ROLE_MAP: Dict[str, str] = {
-    "user": "user",
-    "assistant": "assistant",
-    "user_text": "user",
-    "assistant_text": "assistant",
-    "tool_question": "user",
-    "tool_answer": "assistant",
-}
-
-
-def _recent_entries(conv: Dict[str, Any], max_tokens: int = 3000) -> list[dict]:
-    """Return up to ~max_tokens of recent transcript entries, chronological,
-    with roles normalized into the Realtime model's {user, assistant} space.
-    Token estimate is len(text) // 4 — conservative for English."""
-    entries = conv.get("entries") or []
-    out: list[dict] = []
-    used = 0
-    for entry in reversed(entries):
-        role = _ENTRY_ROLE_MAP.get(entry.get("role"))
-        if not role:
-            continue
-        text = (entry.get("text") or "").strip()
-        if not text:
-            continue
-        tok = max(1, len(text) // 4)
-        if used + tok > max_tokens and out:
-            break
-        item = {"role": role, "text": text, "ts": entry.get("ts")}
-        task_id = entry.get("task_id")
-        if task_id:
-            item["task_id"] = task_id
-        out.append(item)
-        used += tok
-    out.reverse()
-    return out
 
 
 ASK_AGENT_TOOL_SCHEMA = {
@@ -199,62 +146,60 @@ ASK_AGENT_TOOL_SCHEMA = {
 # its own capabilities. Leave empty for the generic public scaffold.
 AGENT_DEPLOYMENT_NOTE = os.getenv("AGENT_DEPLOYMENT_NOTE", "").strip()
 
-# Customize this for your agent. Rules 5-9 are quality scaffolding kept from
-# the prior revision. Rule 2 changed in May 2026: gpt-realtime now handles
-# asynchronous function calls natively, so the prior "stay silent" rule was
-# actively suppressing a paid-for capability.
+# Tool-call routing prompt. Tightened May 2026 for gpt-realtime-2 GA: the
+# model has GPT-5-class reasoning and 128K context, plus native preambles
+# ("let me check that") and async function calling that keep the conversation
+# flowing during tool waits — so the prior hand-coded bridging rules are gone,
+# replaced by a stronger bias toward in-session answers and a sharper anti-
+# fabrication line.
 _BASE_PROMPT = """\
-You are a live voice assistant. Your voice is the OpenAI realtime model.
-Your *brain* is consulted via the ask_agent tool, which routes to a backend
-agent loop with full memory, skills, and external integrations.
+You are a live voice assistant with access to the user's deep context via
+the ask_agent tool, which routes to a backend agent loop with the user's
+full memory, skills, calendar, email, files, and external integrations.
 
 CRITICAL TOOL-CALL RULES:
-1. Use the conversation you already have first. If the user's turn can be
+1. Prefer answering from in-session context. If the user's turn can be
    fully answered from a prior ask_agent answer in this same call, or is a
-   clarification, recap, comparison, or refinement of context already
-   established here, answer directly without calling ask_agent. The prior
-   tool answers are in your context window - use them.
-2. During an ask_agent call you may say one short bridging line ("one sec",
-   "looking now") if the wait is going long. If the wait exceeds ~25 seconds,
-   drop another brief "still working on it" beat every 20-30 seconds so the
-   user knows you haven't dropped. Never invent the answer while waiting.
-   Short interjections are fine; running narration is not.
-3. After the tool result arrives, speak the answer naturally and briefly.
-   Phone-call tempo: <=2 sentences per turn unless asked for more. Numbers
-   spoken naturally ("ten thirty", not "10:30 colon zero zero"). No markdown.
-4. Call ask_agent when the answer requires anything you do NOT already have
-   from this call: external/current facts (calendar, email, files, web),
-   cross-session memory ("what did we say last time"), verification of
-   freshness, drafting that needs durable voice, novel reasoning that
-   benefits from the agent's skills, or any user-specific fact not yet
-   established here. Never fabricate user-specific facts - if unsure
-   whether your context covers it, escalate.
+   clarification, recap, comparison, refinement, or follow-up reasoning on
+   context already established here, answer directly. Trust your reasoning;
+   prior tool answers are in your context window — use them.
+2. Call ask_agent ONLY when the answer requires something you do NOT already
+   have: external/current facts (calendar, email, files, web), cross-session
+   memory ("what did we say last time"), verification of freshness, drafting
+   that needs the user's durable voice, novel reasoning that benefits from
+   agent skills, or any user-specific fact not yet established here.
+3. ANTI-FABRICATION: never invent user-specific facts. If you are unsure
+   whether your in-session context actually covers a name, date, file,
+   commitment, or decision the user is asking about, escalate via ask_agent
+   rather than guess. A clean "I'd need to check" is better than a confident
+   wrong answer; a tool call is better still.
 
 ANSWER-QUALITY RULES:
-5. If you don't have the info or aren't confident, say so directly. "I don't
-   have that" or "I'd need to check" beats a guess. A clear no is more useful
-   than a wrong yes.
-6. Don't synthesize beyond what ask_agent returned. If the agent said it
+4. If you don't have the info or aren't confident, say so directly. "I don't
+   have that" or "I'd need to check" beats a guess.
+5. Don't synthesize beyond what ask_agent returned. If the agent said it
    doesn't know, say you don't know. Don't fill gaps.
-7. If ask_agent returns a list (meetings, emails, files, options), enumerate
-   it briefly first - "You have three: A, B, and C" - then synthesize. Don't
+6. If ask_agent returns a list (meetings, emails, files, options), enumerate
+   briefly first — "You have three: A, B, and C" — then synthesize. Don't
    blend distinct items into one fuzzy summary.
 
 VERIFIED COMPLETION RULES:
-8. Don't say "done", "sent", "created", "updated", or "saved" unless
-   ask_agent's answer included a concrete handle - a file path, ID, link,
-   or timestamp confirming the action. If the agent said it queued or drafted
+7. Don't say "done", "sent", "created", "updated", or "saved" unless
+   ask_agent's answer included a concrete handle — a file path, ID, link,
+   or timestamp confirming the action. If the agent queued or drafted
    something, say "I asked for it" or "drafted", not "done".
 
 STYLE RULES:
-9. Lead with the answer - the number, the time, the yes/no, the decision.
+8. Lead with the answer — the number, the time, the yes/no, the decision.
    Reasons after, only if asked or load-bearing.
+9. Phone-call tempo: ≤2 sentences per turn unless asked for more. Numbers
+   spoken naturally ("ten thirty", not "10:30 colon zero zero").
 
 TOOL-FAILURE HONESTY:
 10. If ask_agent's answer starts with "Agent is temporarily unreachable" or
     is empty, say so plainly and ask the user to repeat. Never invent.
 
-CAPABILITIES (TRUTH - DO NOT CONTRADICT):
+CAPABILITIES (TRUTH — DO NOT CONTRADICT):
 - Questions about your model, voice, logs, file capabilities, or where data
   lives must be answered via ask_agent. The agent knows its own setup; you
   do not. Do not improvise refusals like "I don't have access to that".
@@ -280,31 +225,16 @@ def _new_conv_id() -> str:
     return secrets.token_urlsafe(12)
 
 
-async def _iter_sse_with_idle_watchdog(response: "httpx.Response", idle_timeout: float):
-    """Yield non-empty SSE lines; raise asyncio.TimeoutError on idle stalls.
+async def _agent_chat_inner(conv_id: str, user_text: str) -> str:
+    """Forward a single user turn to the backend agent and return the full text.
 
-    A streaming chat-completions endpoint typically emits content deltas,
-    progress events, and `: keepalive` comment frames during long agent
-    loops, so any idle period longer than the keepalive cadence (~30s)
-    indicates a stuck server, not a slow operation.
+    The backend speaks chat-completions SSE; we consume the stream and assemble
+    the answer. Total wall time is capped by ``_agent_chat`` via asyncio.wait_for,
+    so this inner does not need its own total-timeout guard.
     """
-    aiter = response.aiter_lines()
-    while True:
-        try:
-            line = await asyncio.wait_for(aiter.__anext__(), timeout=idle_timeout)
-        except StopAsyncIteration:
-            return
-        if line:
-            yield line
-
-
-async def _agent_chat(conv_id: str, user_text: str) -> str:
     if not AGENT_API_KEY:
         raise RuntimeError("Agent API key not configured")
-    # SSE streaming: connection stays alive for any agent-loop duration via
-    # the backend's keepalive frames. We bound only idle gaps, not total
-    # duration, since legitimate calls span 4-180s depending on which
-    # skills the agent invokes.
+    # Per-chunk read timeout is loose because asyncio.wait_for caps total time.
     timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
     chunks: list[str] = []
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -324,8 +254,8 @@ async def _agent_chat(conv_id: str, user_text: str) -> str:
             },
         ) as r:
             r.raise_for_status()
-            async for line in _iter_sse_with_idle_watchdog(r, ASK_AGENT_IDLE_TIMEOUT):
-                if not line.startswith("data: "):
+            async for line in r.aiter_lines():
+                if not line or not line.startswith("data: "):
                     continue
                 payload = line[len("data: "):]
                 if payload == "[DONE]":
@@ -339,6 +269,15 @@ async def _agent_chat(conv_id: str, user_text: str) -> str:
                 if piece:
                     chunks.append(piece)
     return "".join(chunks)
+
+
+async def _agent_chat(conv_id: str, user_text: str) -> str:
+    """Cap the inner forward at ASK_AGENT_TIMEOUT_SEC. Raises asyncio.TimeoutError
+    on overrun — caller maps that to the structured-unreachable sentinel."""
+    return await asyncio.wait_for(
+        _agent_chat_inner(conv_id, user_text),
+        timeout=ASK_AGENT_TIMEOUT_SEC,
+    )
 
 
 # ---- routes ----------------------------------------------------------------
@@ -363,13 +302,21 @@ async def health(request: web.Request) -> web.Response:
     })
 
 
-async def _mint_realtime_session() -> dict:
-    """Mint an OpenAI Realtime ephemeral session. Raises on HTTP/network error."""
+async def _mint_realtime_session(instructions_suffix: str | None = None) -> dict:
+    """Mint an OpenAI Realtime ephemeral session. Raises on HTTP/network error.
+
+    ``instructions_suffix`` is appended to the base ``VOICE_SYSTEM_PROMPT`` —
+    used on resume to splice in a handoff-note continuation directive without
+    requiring a follow-up session.update from the client.
+    """
+    instructions = VOICE_SYSTEM_PROMPT
+    if instructions_suffix:
+        instructions = instructions + "\n\n" + instructions_suffix
     body = {
         "model": OPENAI_REALTIME_MODEL,
         "voice": OPENAI_REALTIME_VOICE,
         "modalities": ["audio", "text"],
-        "instructions": VOICE_SYSTEM_PROMPT,
+        "instructions": instructions,
         "tools": [ASK_AGENT_TOOL_SCHEMA],
         "tool_choice": "auto",
         "turn_detection": {
@@ -416,7 +363,6 @@ async def session_mint(request: web.Request) -> web.Response:
         "started_at": now,
         "last_activity_ts": now,
         "entries": [],
-        "agent_tasks": {},
     }
     try:
         data = await _mint_realtime_session()
@@ -446,75 +392,18 @@ def _structured_unreachable(error_type: str) -> dict:
     }
 
 
-async def _run_agent_task(conv_id: str, task_id: str) -> None:
-    """Run the agent SSE stream as a server-side task. Survives client disconnect.
-
-    Updates ``conv["agent_tasks"][task_id]`` with status/answer; touches
-    ``last_activity_ts`` on completion so a long deep-context call doesn't
-    get reaped while productive work is happening. Records the transcript
-    pair via the local ``conv`` reference -- safe even if /api/end pops the
-    conv mid-stream (the dict object survives via this function's closure).
-    """
-    conv = CONVERSATIONS.get(conv_id)
-    if conv is None:
-        return
-    task_state = conv["agent_tasks"].get(task_id)
-    if task_state is None:
-        return
-    question = task_state["question"]
-    try:
-        answer = await _agent_chat(conv_id, question)
-        status = "done"
-        error_type = None
-    except asyncio.CancelledError:
-        task_state["status"] = "cancelled"
-        task_state["finished_at"] = time.time()
-        log_call_event(LOG_DIR, conv_id, "ask_agent_cancelled", task_id=task_id)
-        raise
-    except httpx.TimeoutException:
-        answer = _structured_unreachable("timeout")["answer"]
-        status = "error"
-        error_type = "timeout"
-    except Exception as e:  # noqa: BLE001
-        log.exception("agent task failed")
-        answer = _structured_unreachable(type(e).__name__)["answer"]
-        status = "error"
-        error_type = type(e).__name__
-    finished_at = time.time()
-    task_state["answer"] = answer
-    task_state["status"] = status
-    task_state["finished_at"] = finished_at
-    latency_ms = int((finished_at - task_state["started_at"]) * 1000)
-    log_call_event(
-        LOG_DIR, conv_id, "ask_agent_done",
-        task_id=task_id, latency_ms=latency_ms, chars=len(answer),
-        status=status, error_type=error_type,
-    )
-    # Belt-and-suspenders: append to the LOCAL conv ref. Even if /api/end
-    # popped the conv from CONVERSATIONS during the SSE stream, the dict is
-    # still alive via this closure -- no KeyError.
-    conv["entries"].append({"role": "tool_question", "text": question, "ts": task_state["started_at"]})
-    conv["entries"].append({"role": "tool_answer", "text": answer, "ts": finished_at})
-    # Touch activity so deep work doesn't get reaped while it's actually running.
-    conv["last_activity_ts"] = finished_at
-    # If the conv was already popped (rare: user hit End mid-stream), surface
-    # the late turn forensically.
-    if CONVERSATIONS.get(conv_id) is None:
-        log_call_event(LOG_DIR, conv_id, "late_turn", task_id=task_id, chars=len(answer))
-
-
 async def ask_agent(request: web.Request) -> web.Response:
-    """Spawn an agent task; return inline if the fast-path completes in time.
+    """Synchronous forward to the backend agent. Returns the answer inline.
 
-    Otherwise return ``{task_id, status: "running"}`` and let the client
-    long-poll ``/api/agent-task/<task_id>``. The task survives client
-    disconnect (Gary backgrounds the iPhone, the work keeps going).
+    gpt-realtime-2 has GPT-5-class reasoning and native preambles + async
+    function calling, so the prior fast-path / long-poll / task-id machinery
+    is gone — the model itself bridges the wait by speaking to the user.
+    Total wait is capped at ``ASK_AGENT_TIMEOUT_SEC``; ``intent_type`` and
+    ``freshness_required`` are logged for routing telemetry but not branched on.
     """
     body = await request.json()
     conv_id = body.get("conv_id")
     question = (body.get("question") or "").strip()
-    realtime_call_id = body.get("call_id")
-    # Routing telemetry the model declares per-call. Phase 0: logged, not branched on.
     intent_type = (body.get("intent_type") or "unknown").strip() or "unknown"
     freshness_required = bool(body.get("freshness_required"))
     conv = CONVERSATIONS.get(conv_id) if conv_id else None
@@ -524,90 +413,47 @@ async def ask_agent(request: web.Request) -> web.Response:
     if not question:
         return web.json_response({"answer": "(empty question)"}, status=200)
 
-    in_flight = sum(1 for t in conv["agent_tasks"].values() if t["status"] == "running")
-    if in_flight >= MAX_CONCURRENT_AGENT_TASKS:
-        log_call_event(LOG_DIR, conv_id, "tool_error", error_type="too_many_in_flight", in_flight=in_flight)
-        return web.json_response({**_structured_unreachable("too_many_in_flight"), "task_id": None}, status=200)
-
     _touch(conv)
-    task_id = _new_task_id()
+    started_at = time.time()
     prior_ask_count = sum(1 for e in conv["entries"] if e.get("role") == "tool_question")
-    log.info("ask_agent [%s/%s] (%s, fresh=%s): %s",
-             conv_id, task_id, intent_type, freshness_required, question[:120])
+    log.info("ask_agent [%s] (%s, fresh=%s): %s",
+             conv_id, intent_type, freshness_required, question[:120])
     log_call_event(
         LOG_DIR, conv_id, "ask_agent_spawned",
-        task_id=task_id, chars=len(question),
+        chars=len(question),
         intent_type=intent_type, freshness_required=freshness_required,
         prior_ask_count=prior_ask_count,
     )
-    state = {
-        "task_id": task_id,
-        "question": question,
-        "status": "running",
-        "answer": None,
-        "started_at": time.time(),
-        "finished_at": None,
-        "realtime_call_id": realtime_call_id,
-        "delivered_to_realtime": False,
-        "task": None,
-    }
-    conv["agent_tasks"][task_id] = state
-    coro = _run_agent_task(conv_id, task_id)
-    task = asyncio.create_task(coro)
-    state["task"] = task
-
-    # Fast path: wait briefly for completion so chitchat-grade calls don't
-    # round-trip through /api/agent-task.
+    error_type: str | None = None
     try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=ASK_AGENT_FAST_PATH_SEC)
+        answer = await _agent_chat(conv_id, question)
+        status = "done"
     except asyncio.TimeoutError:
-        return web.json_response({"task_id": task_id, "status": "running"})
-    except asyncio.CancelledError:
-        # The task itself was cancelled (e.g., conv ended). Surface as such.
-        return web.json_response({"task_id": task_id, "status": "cancelled", "answer": ""})
-    return web.json_response({
-        "task_id": task_id,
-        "status": state["status"],
-        "answer": state.get("answer") or "",
-    })
-
-
-async def agent_task(request: web.Request) -> web.Response:
-    """Long-poll endpoint for a server-side agent task.
-
-    Returns when status != running, or after AGENT_TASK_LONG_POLL_SEC --
-    whichever comes first. The client retries until status is final.
-    """
-    task_id = request.match_info["task_id"]
-    conv_id = request.query.get("conv_id")
-    conv = CONVERSATIONS.get(conv_id) if conv_id else None
-    if conv is None:
-        return web.json_response({"error": "unknown_conv_id"}, status=400)
-    _ensure_conv_shape(conv)
-    state = conv["agent_tasks"].get(task_id)
-    if state is None:
-        return web.json_response({"error": "unknown_task_id", "status": "unknown"}, status=404)
-    task = state.get("task")
-    if task is not None and not task.done():
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=AGENT_TASK_LONG_POLL_SEC)
-        except asyncio.TimeoutError:
-            pass
-        except asyncio.CancelledError:
-            pass
-    if state["status"] == "running":
-        return web.json_response({"task_id": task_id, "status": "running"})
-    # Mark delivered; idempotent for duplicate pollers.
-    already = state["delivered_to_realtime"]
-    state["delivered_to_realtime"] = True
-    if not already:
-        log_call_event(LOG_DIR, conv_id, "ask_agent_delivered_to_realtime", task_id=task_id)
-    return web.json_response({
-        "task_id": task_id,
-        "status": state["status"],
-        "answer": state.get("answer") or "",
-        "already_delivered": already,
-    })
+        answer = _structured_unreachable("timeout")["answer"]
+        status = "error"
+        error_type = "timeout"
+    except httpx.TimeoutException:
+        answer = _structured_unreachable("timeout")["answer"]
+        status = "error"
+        error_type = "timeout"
+    except Exception as e:  # noqa: BLE001
+        log.exception("ask_agent failed")
+        answer = _structured_unreachable(type(e).__name__)["answer"]
+        status = "error"
+        error_type = type(e).__name__
+    finished_at = time.time()
+    latency_ms = int((finished_at - started_at) * 1000)
+    log_call_event(
+        LOG_DIR, conv_id, "ask_agent_done",
+        latency_ms=latency_ms, chars=len(answer),
+        status=status, error_type=error_type,
+    )
+    # Persist the question/answer pair to the transcript even if the conv was
+    # popped mid-call by /api/end (the dict survives via this closure ref).
+    conv["entries"].append({"role": "tool_question", "text": question, "ts": started_at})
+    conv["entries"].append({"role": "tool_answer", "text": answer, "ts": finished_at})
+    conv["last_activity_ts"] = finished_at
+    return web.json_response({"answer": answer, "status": status})
 
 
 async def text_turn(request: web.Request) -> web.Response:
@@ -641,11 +487,13 @@ async def text_turn(request: web.Request) -> web.Response:
 
 
 async def resume_call(request: web.Request) -> web.Response:
-    """Mint a fresh OpenAI Realtime ephemeral session bound to the same conv.
+    """Mint a fresh Realtime ephemeral session bound to the same conv.
 
-    Returns answers the user missed while away (``completed_while_away``) so
-    the new realtime session can speak them, plus pointers to any tasks
-    still running (``still_working``) so the client can re-attach long polls.
+    Continuity is delivered via the freshly-minted session's ``instructions``
+    (the handoff-note continuation suffix is baked in server-side). 128K
+    context + GPT-5-class reasoning means we don't need a recent-entries
+    replay primer; the dying session's handoff note is the sole continuity
+    signal.
     """
     body = await request.json()
     conv_id = body.get("conv_id")
@@ -655,8 +503,19 @@ async def resume_call(request: web.Request) -> web.Response:
     _ensure_conv_shape(conv)
     if not OPENAI_API_KEY:
         return web.json_response({"error": "no_openai_key"}, status=500)
+    note = (conv.get("handoff_note") or "").strip()
+    suffix = None
+    if note:
+        suffix = (
+            "Continuation context from earlier in this same call: "
+            + note
+            + "\n\nCritical: do not greet, do not acknowledge any pause, do "
+            + "not say 'as I was saying' or similar filler. Continue exactly "
+            + "where you left off in topic and tone. Wait for the user's next "
+            + "utterance before responding."
+        )
     try:
-        data = await _mint_realtime_session()
+        data = await _mint_realtime_session(instructions_suffix=suffix)
     except httpx.HTTPStatusError as e:
         log.error("resume mint failed: %s %s", e.response.status_code, e.response.text[:300])
         return web.json_response({"error": "ephemeral_mint_failed", "detail": e.response.text[:300]}, status=502)
@@ -664,39 +523,15 @@ async def resume_call(request: web.Request) -> web.Response:
         log.exception("resume mint exception")
         return web.json_response({"error": "ephemeral_mint_exception", "detail": str(e)}, status=502)
     _touch(conv)
-    completed_while_away: list[dict] = []
-    still_working: list[dict] = []
-    now = time.time()
-    for tid, state in list(conv["agent_tasks"].items()):
-        if state["status"] in ("done", "error") and not state["delivered_to_realtime"]:
-            completed_while_away.append({
-                "task_id": tid,
-                "question": state["question"],
-                "answer": state.get("answer") or "",
-            })
-            state["delivered_to_realtime"] = True
-            log_call_event(LOG_DIR, conv_id, "ask_agent_carried_over_on_resume", task_id=tid)
-        elif state["status"] == "running":
-            still_working.append({
-                "task_id": tid,
-                "question": state["question"],
-                "elapsed_s": int(now - state["started_at"]),
-            })
-    recent_entries = _recent_entries(conv)
     log_call_event(
         LOG_DIR, conv_id, "resumed",
-        completed=len(completed_while_away), still_working=len(still_working),
-        handoff_note_chars=len(conv.get("handoff_note") or ""),
-        recent_entries=len(recent_entries),
+        handoff_note_chars=len(note),
     )
     return web.json_response({
         "conv_id": conv_id,
         "session": data,
         "resumed": True,
-        "completed_while_away": completed_while_away,
-        "still_working": still_working,
-        "handoff_note": conv.get("handoff_note"),
-        "recent_entries": recent_entries,
+        "handoff_note": note or None,
     })
 
 
@@ -748,16 +583,6 @@ async def handoff_note(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-def _cancel_in_flight_tasks(conv: dict) -> int:
-    n = 0
-    for tid, state in list(conv.get("agent_tasks", {}).items()):
-        task = state.get("task")
-        if task and not task.done():
-            task.cancel()
-            n += 1
-    return n
-
-
 async def end_call(request: web.Request) -> web.Response:
     """Explicit End. Backgrounding NO LONGER triggers this -- only the End
     button or pagehide. Idempotent for duplicate fires."""
@@ -778,7 +603,6 @@ async def end_call(request: web.Request) -> web.Response:
     conv = CONVERSATIONS.pop(conv_id, None)
     if conv is None:
         return web.json_response({"ok": True, "noop": "already_ended"})
-    cancelled = _cancel_in_flight_tasks(conv)
     all_entries = sorted(conv["entries"] + client_entries, key=lambda e: e.get("ts", 0))
     metrics = compute_routing_metrics(LOG_DIR, conv_id)
     path = write_transcript(conv_id, conv["started_at"], all_entries, metrics=metrics)
@@ -802,7 +626,7 @@ async def end_call(request: web.Request) -> web.Response:
     log_call_event(
         LOG_DIR, conv_id, "ended",
         reason=reason, duration_s=int(ended_at - conv["started_at"]),
-        cancelled_tasks=cancelled, slack_posted=slack_posted,
+        slack_posted=slack_posted,
         ask_agent_count=metrics["ask_agent_count"],
         local_answer_turns=metrics["local_answer_turns"],
         ask_ratio=metrics["ask_ratio"],
@@ -843,7 +667,6 @@ async def _reap_stale_conversations() -> None:
             conv = CONVERSATIONS.pop(cid, None)
             if conv is None:
                 continue
-            cancelled = _cancel_in_flight_tasks(conv)
             ended_at = time.time()
             all_entries = sorted(conv.get("entries", []), key=lambda e: e.get("ts", 0))
             metrics = compute_routing_metrics(LOG_DIR, cid)
@@ -866,7 +689,7 @@ async def _reap_stale_conversations() -> None:
             log_call_event(
                 LOG_DIR, cid, "reaped",
                 reason="idle_timeout", duration_s=int(ended_at - conv["started_at"]),
-                cancelled_tasks=cancelled, slack_posted=slack_posted,
+                slack_posted=slack_posted,
                 ask_agent_count=metrics["ask_agent_count"],
                 local_answer_turns=metrics["local_answer_turns"],
                 ask_ratio=metrics["ask_ratio"],
@@ -913,7 +736,6 @@ def make_app() -> web.Application:
     app.router.add_post("/api/session", session_mint)
     app.router.add_post("/api/ask-agent", ask_agent)
     app.router.add_post("/api/client-event", client_event)
-    app.router.add_get("/api/agent-task/{task_id}", agent_task)
     app.router.add_post("/api/text-turn", text_turn)
     app.router.add_post("/api/resume", resume_call)
     app.router.add_post("/api/premint-session", premint_session)

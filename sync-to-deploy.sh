@@ -61,8 +61,23 @@ add_if_missing() {
 }
 echo "patching $env_file"
 add_if_missing AGENT_API_BASE '${HERMES_BASE:-http://127.0.0.1:8642}'
-add_if_missing ASK_AGENT_IDLE_TIMEOUT '${ASK_HERMES_IDLE_TIMEOUT:-45}'
-add_if_missing AGENT_DEPLOYMENT_NOTE 'You run on Gary'\''s Mac Mini. The agent backend (Hermes) has full filesystem access -- it can write files anywhere including ~/Desktop and the Obsidian vault. The diagnostic log lives at ~/.hermes-custom/hermes-mini/logs/calls/<conv_id>.ndjson. Voice = gpt-realtime. Brain = gpt-5.5 via Codex OAuth, with Ollama Gemma-4-E4B and OpenRouter Gemini-3.1-Pro fallbacks. If asked anything about logs, models, file capabilities, or where data lives -- call ask_agent. Do not improvise.'
+add_if_missing ASK_AGENT_TIMEOUT_SEC '90'
+add_if_missing AGENT_DEPLOYMENT_NOTE 'You run on Gary'\''s Mac Mini. The agent backend (Hermes) has full filesystem access -- it can write files anywhere including ~/Desktop and the Obsidian vault. The diagnostic log lives at ~/.hermes-custom/hermes-mini/logs/calls/<conv_id>.ndjson. Voice = gpt-realtime-2. Brain = gpt-5.5 via Codex OAuth, with Ollama Gemma-4-E4B and OpenRouter Gemini-3.1-Pro fallbacks. If asked anything about logs, models, file capabilities, or where data lives -- call ask_agent. Do not improvise.'
+
+# Bump model to gpt-realtime-2 if still pinned to the legacy name (May 2026
+# cutover). Idempotent — does nothing if already gpt-realtime-2 or unset.
+if grep -q '^OPENAI_REALTIME_MODEL=gpt-realtime$' "$env_file"; then
+  sed -i.bak 's/^OPENAI_REALTIME_MODEL=gpt-realtime$/OPENAI_REALTIME_MODEL=gpt-realtime-2/' "$env_file"
+  rm -f "$env_file.bak"
+  echo "  ~ OPENAI_REALTIME_MODEL → gpt-realtime-2 (May 2026 GA cutover)"
+fi
+
+# Drop the obsolete idle-watchdog var if present (replaced by ASK_AGENT_TIMEOUT_SEC).
+if grep -q '^ASK_AGENT_IDLE_TIMEOUT=' "$env_file"; then
+  sed -i.bak '/^ASK_AGENT_IDLE_TIMEOUT=/d' "$env_file"
+  rm -f "$env_file.bak"
+  echo "  - ASK_AGENT_IDLE_TIMEOUT (obsolete; superseded by ASK_AGENT_TIMEOUT_SEC)"
+fi
 
 echo "kicking launchd service"
 launchctl kickstart -k "gui/$(id -u)/${LAUNCHD_LABEL}" || \
