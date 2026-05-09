@@ -2,6 +2,9 @@
 // Free of frameworks; vanilla DOM + fetch + RTCPeerConnection.
 
 const $ = (id) => document.getElementById(id);
+// Pass through the page URL's query (e.g. ?mode=triage) to /api/session so the
+// server knows whether to inject the open-loops brief into the system prompt.
+const sessionEndpoint = () => `/api/session${window.location.search || ""}`;
 const transcriptEl = $("transcript");
 const statusEl = $("status");
 const dotEl = $("health-dot");
@@ -375,7 +378,7 @@ async function startCall() {
   setStatus("minting session...");
   let session;
   try {
-    const r = await fetch("/api/session", { method: "POST" });
+    const r = await fetch(sessionEndpoint(), { method: "POST" });
     if (!r.ok) throw new Error(`session ${r.status}`);
     session = await r.json();
   } catch (e) {
@@ -1043,7 +1046,7 @@ textForm.addEventListener("submit", async (ev) => {
   if (!text) return;
   if (!convId) {
     try {
-      const r = await fetch("/api/session", { method: "POST" });
+      const r = await fetch(sessionEndpoint(), { method: "POST" });
       const d = await r.json();
       convId = d.conv_id;
     } catch (e) {

@@ -441,16 +441,23 @@ async def session_mint(request: web.Request) -> web.Response:
         "last_activity_ts": now,
         "entries": [],
     }
+    # Triage mode is opt-in via ?mode=triage. Default sessions stay user-driven.
+    mode = (request.query.get("mode") or "").strip().lower()
+    suffix = _load_open_loops_brief() if mode == "triage" else None
     try:
-        data = await _mint_realtime_session(instructions_suffix=_load_open_loops_brief())
+        data = await _mint_realtime_session(instructions_suffix=suffix)
     except httpx.HTTPStatusError as e:
         log.error("ephemeral mint failed: %s %s", e.response.status_code, e.response.text[:300])
         return web.json_response({"error": "ephemeral_mint_failed", "detail": e.response.text[:300]}, status=502)
     except Exception as e:  # noqa: BLE001
         log.exception("ephemeral mint exception")
         return web.json_response({"error": "ephemeral_mint_exception", "detail": str(e)}, status=502)
-    log_call_event(LOG_DIR, conv_id, "session_minted", model=OPENAI_REALTIME_MODEL, voice=OPENAI_REALTIME_VOICE)
-    return web.json_response({"conv_id": conv_id, "session": data})
+    log_call_event(
+        LOG_DIR, conv_id, "session_minted",
+        model=OPENAI_REALTIME_MODEL, voice=OPENAI_REALTIME_VOICE,
+        mode=mode or "default", brief_injected=bool(suffix),
+    )
+    return web.json_response({"conv_id": conv_id, "session": data, "mode": mode or "default"})
 
 
 _AGENT_UNREACHABLE_SENTINEL = "Agent is temporarily unreachable"
