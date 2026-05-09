@@ -47,6 +47,30 @@ let lastSessionConfig = null;
 // Reset on response.done so client_response_done can report it accurately.
 let hadFunctionCallThisResponse = false;
 
+// --- Forced-reconnect continuity state ---
+// `responseInFlight` flips on response.created and back on response.done. The
+// handoff-note request is gated on it being false (one outstanding response at
+// a time per Realtime contract).
+let responseInFlight = false;
+// Single in-flight handoff request: { responseId, buffer, resolve, t0 }.
+// `responseId` is null until response.created arrives, then bound to the real id
+// so subsequent response.text.delta events route to the right buffer.
+let activeHandoffRequest = null;
+// Bumped whenever we tear down the peer for resume; in-flight pollAgentTask
+// loops capture this generation at start and short-circuit if it changes.
+let pollAbortGen = 0;
+// Set true when the new peer's audio track first emits frames (pc.ontrack).
+// Drives the brown-noise fade-out timing on resume.
+let firstAudioFrameSeen = false;
+// Wall-clock when the current Realtime session attached. Drives the 60-min cap
+// pre-mint scheduling.
+let sessionStartedAt = null;
+// Pre-minted session payload + ephemeral expiry (Unix seconds).
+let premintedSession = null;
+let premintedExpiresAt = null;
+let premintTimer = null;
+let capSwapTimer = null;
+
 function logClientEvent(event, payload = {}) {
   if (!convId) return;
   fetch("/api/client-event", {
@@ -216,6 +240,8 @@ async function checkHealth() {
 async function attachPeer(session, resumeContext) {
   const ephemeral = session.session.client_secret.value;
   const model = session.session.model || "gpt-realtime";
+  // Reset for the brown-noise bridge: flips true when first audio frame arrives.
+  firstAudioFrameSeen = false;
 
   const newPc = new RTCPeerConnection();
   newPc.onconnectionstatechange = () => onConnectionStateChange(newPc);
@@ -227,8 +253,16 @@ async function attachPeer(session, resumeContext) {
   const audioEl = document.createElement("audio");
   audioEl.autoplay = true;
   audioEl.playsInline = true;
-  newPc.ontrack = (ev) => { audioEl.srcObject = ev.streams[0]; };
+  newPc.ontrack = (ev) => {
+    audioEl.srcObject = ev.streams[0];
+    firstAudioFrameSeen = true;
+  };
   micStream.getTracks().forEach((t) => newPc.addTrack(t, micStream));
+  // Preserve mute state across resume -- attachPeer is called with the user's
+  // existing micStream, but the new peer doesn't know they had toggled mute.
+  if (micMuted) {
+    micStream.getAudioTracks().forEach((t) => { t.enabled = false; });
+  }
   const newDc = newPc.createDataChannel("oai-events");
   newDc.addEventListener("open", () => onDcOpen(resumeContext));
   newDc.addEventListener("message", onDcMessage);
@@ -248,6 +282,8 @@ async function attachPeer(session, resumeContext) {
   // Swap globals only after success.
   pc = newPc;
   dc = newDc;
+  sessionStartedAt = Date.now();
+  schedulePremint();
   startConnectionWatchdog();
 }
 
@@ -314,6 +350,17 @@ function onDcOpen(resumeContext) {
   // endpoint accepts null fields like input_audio_transcription.language but
   // session.update rejects them as invalid_type).
   const cfg = lastSessionConfig || {};
+  // Append handoff-note continuation suffix into instructions BEFORE building
+  // the session.update patch -- single source of truth for resume continuity.
+  let resumeInstructions = cfg.instructions;
+  if (resumeContext?.handoff_note) {
+    resumeInstructions = (cfg.instructions || "") +
+      "\n\nContinuation context from earlier in this same call: " +
+      resumeContext.handoff_note +
+      "\n\nCritical: do not greet, do not acknowledge any pause, do not say " +
+      "'as I was saying' or similar filler. Continue exactly where you left " +
+      "off in topic and tone. Wait for the user's next utterance before responding.";
+  }
   if (cfg.tools || cfg.instructions) {
     const stripNulls = (obj) => {
       if (!obj || typeof obj !== "object") return obj;
@@ -325,7 +372,7 @@ function onDcOpen(resumeContext) {
     };
     const sessionPatch = {
       modalities: cfg.modalities || ["audio", "text"],
-      instructions: cfg.instructions,
+      instructions: resumeInstructions,
       tools: cfg.tools || [],
       tool_choice: cfg.tool_choice || "auto",
       turn_detection: cfg.turn_detection,
@@ -340,9 +387,11 @@ function onDcOpen(resumeContext) {
   logClientEvent("client_dc_opened", {
     tools_in_session: (cfg.tools || []).map((t) => t.name),
     tool_choice: cfg.tool_choice || null,
-    instructions_chars: (cfg.instructions || "").length,
+    instructions_chars: (resumeInstructions || "").length,
     resume: !!resumeContext,
     session_update_sent: !!(cfg.tools || cfg.instructions),
+    handoff_note_chars: (resumeContext?.handoff_note || "").length,
+    recent_entries: (resumeContext?.recent_entries || []).length,
   });
 
   if (!resumeContext) {
@@ -352,9 +401,27 @@ function onDcOpen(resumeContext) {
     });
     return;
   }
+  // Replay recent transcript as conversation history BEFORE the completed-loop
+  // dedupe reads `deliveredTaskIds`. This restores the surrounding chitchat
+  // context so the model isn't amnesic about topic and tone.
+  const recent = resumeContext.recent_entries || [];
+  for (const entry of recent) {
+    if (entry.task_id) deliveredTaskIds.add(entry.task_id);
+    if (entry.role !== "user" && entry.role !== "assistant") continue;
+    send({
+      type: "conversation.item.create",
+      item: {
+        type: "message", role: entry.role,
+        content: [{ type: entry.role === "user" ? "input_text" : "text", text: entry.text }],
+      },
+    });
+  }
+  if (recent.length) {
+    logClientEvent("client_resume_transcript_replayed", { count: recent.length });
+  }
   // Resume path: replay any answers the user missed as a normal user/assistant
   // pair (NOT function_call_output -- the call_id belonged to the dead session
-  // and Realtime would reject it). Then ask the model to greet + walk through.
+  // and Realtime would reject it).
   const completed = resumeContext.completed_while_away || [];
   for (const item of completed) {
     if (deliveredTaskIds.has(item.task_id)) continue;
@@ -370,17 +437,37 @@ function onDcOpen(resumeContext) {
     appendBubble("tool", `↻ carried over: ${item.question}`);
     appendBubble("tool", `← ${item.answer}`);
   }
-  let primer;
-  if (completed.length > 0) {
-    primer = "User just got back from a brief pause. The agent finished work while they were away. Greet them in one short sentence and offer to walk through the answer(s).";
-  } else {
-    primer = "User just got back from a brief pause. Greet them in one short sentence and continue naturally.";
+  // When handoff_note is present, the instructions suffix carries the full
+  // continuity signal. Skip the heuristic primer + response.create entirely;
+  // semantic_vad will trigger the next response on the user's next utterance.
+  if (!resumeContext.handoff_note) {
+    let primer;
+    if (completed.length > 0) {
+      primer = "User just got back from a brief pause. The agent finished work while they were away. Greet them in one short sentence and offer to walk through the answer(s).";
+    } else {
+      primer = "User just got back from a brief pause. Greet them in one short sentence and continue naturally.";
+    }
+    send({
+      type: "conversation.item.create",
+      item: { type: "message", role: "system", content: [{ type: "input_text", text: primer }] },
+    });
+    send({ type: "response.create" });
   }
-  send({
-    type: "conversation.item.create",
-    item: { type: "message", role: "system", content: [{ type: "input_text", text: primer }] },
-  });
-  send({ type: "response.create" });
+  // Brown-noise bridge fade-out: poll for first audio frame, fade when seen.
+  // Hard cap at 5s so we don't keep the bed playing if no audio ever arrives.
+  if (icebreaker) {
+    const start = Date.now();
+    const poll = setInterval(() => {
+      if (firstAudioFrameSeen || Date.now() - start > 5000) {
+        clearInterval(poll);
+        try { icebreaker.fadeOut(); } catch {}
+        logClientEvent("client_resume_first_audio", {
+          since_dc_open_ms: Date.now() - start,
+          saw_audio: firstAudioFrameSeen,
+        });
+      }
+    }, 100);
+  }
 
   // Reattach long-polls for tasks that are still running on the server.
   const stillWorking = resumeContext.still_working || [];
@@ -442,13 +529,176 @@ function onConnectionStateChange(targetPc) {
   }
 }
 
+// Ask the dying Realtime model for an ≤80-word continuation note for its
+// successor. Skipped if a response is already in flight (Realtime allows only
+// one). Resolves with the captured text (full or partial) or null on hard
+// timeout. Fire-and-forget POST to /api/handoff-note.
+async function requestHandoffNote(reason) {
+  if (!dc || dc.readyState !== "open" || responseInFlight) {
+    logClientEvent("client_handoff_note_skipped", { reason, response_in_flight: responseInFlight });
+    return null;
+  }
+  const t0 = performance.now();
+  let resolveDone;
+  const donePromise = new Promise((r) => { resolveDone = r; });
+  activeHandoffRequest = { responseId: null, buffer: "", resolve: resolveDone, t0 };
+  try {
+    dc.send(JSON.stringify({
+      type: "conversation.item.create",
+      item: {
+        type: "message", role: "system",
+        content: [{ type: "input_text", text:
+          "You are about to be paused mid-call. In ≤80 words write a continuation " +
+          "note for your successor session: user's name and current situation, " +
+          "current topic, tonal observations from this call, anything pending. " +
+          "No greeting, no flattery, no filler. Output only the note." }],
+      },
+    }));
+    dc.send(JSON.stringify({ type: "response.create", response: { modalities: ["text"] } }));
+  } catch (e) {
+    activeHandoffRequest = null;
+    logClientEvent("client_handoff_note_failed", { reason, error: String(e) });
+    return null;
+  }
+  // Race the model's response against a 2.5s deadline. On timeout, use whatever
+  // partial buffer we accumulated -- a half-formed note still beats nothing.
+  const note = await Promise.race([
+    donePromise,
+    new Promise((r) => setTimeout(() => r(activeHandoffRequest?.buffer || null), 2500)),
+  ]);
+  const ms = Math.round(performance.now() - t0);
+  activeHandoffRequest = null;
+  const trimmed = (note || "").trim();
+  if (trimmed) {
+    fetch("/api/handoff-note", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conv_id: convId, note: trimmed, generated_in_ms: ms }),
+    }).catch(() => {});
+    logClientEvent("client_handoff_note_generated", { reason, chars: trimmed.length, generated_in_ms: ms });
+  } else {
+    logClientEvent("client_handoff_note_failed", { reason, deadline_ms: 2500, generated_in_ms: ms });
+  }
+  return trimmed || null;
+}
+
+// Tear down the audio comfort layer. Called only on explicit End -- forced
+// reconnects skip this so the brown-noise bed bridges the silent gap.
+function endIcebreaker() {
+  if (icebreaker) { try { icebreaker.fadeOut(); icebreaker.dispose(); } catch {} icebreaker = null; }
+  ambientBuffer = null;
+  if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
+}
+
+// 60-min cap handling: pre-mint a fresh ephemeral at 58:30, then swap into it
+// at min(59:00, expires_at − 10s). The user never hears the seam.
+const PREMINT_AT_MS = 58 * 60 * 1000 + 30 * 1000;   // 58:30
+const HARD_CAP_AT_MS = 59 * 60 * 1000;              // 59:00 absolute
+
+function schedulePremint() {
+  if (premintTimer) clearTimeout(premintTimer);
+  if (capSwapTimer) clearTimeout(capSwapTimer);
+  premintTimer = setTimeout(doPremint, PREMINT_AT_MS);
+}
+
+async function doPremint() {
+  if (!started || !convId) return;
+  try {
+    const r = await fetch("/api/premint-session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conv_id: convId }),
+    });
+    const data = await r.json();
+    if (!data?.session?.client_secret?.value) {
+      logClientEvent("client_premint_failed", { reason: "no_client_secret" });
+      return;
+    }
+    premintedSession = data;
+    premintedExpiresAt = data.session.client_secret.expires_at || null;
+    const hardCapAbs = (sessionStartedAt || Date.now()) + HARD_CAP_AT_MS;
+    const expiryAbs = premintedExpiresAt ? premintedExpiresAt * 1000 - 10_000 : hardCapAbs;
+    const swapAtAbs = Math.min(hardCapAbs, expiryAbs);
+    const swapInMs = Math.max(0, swapAtAbs - Date.now());
+    capSwapTimer = setTimeout(gracefulCapSwap, swapInMs);
+    logClientEvent("client_premint_started", {
+      expires_at: premintedExpiresAt,
+      swap_in_ms: swapInMs,
+    });
+  } catch (e) {
+    logClientEvent("client_premint_failed", { error: String(e) });
+  }
+}
+
+async function gracefulCapSwap() {
+  if (!started || !convId) return;
+  if (premintedExpiresAt && premintedExpiresAt < Date.now() / 1000 + 5) {
+    premintedSession = null;
+    premintedExpiresAt = null;
+    logClientEvent("client_premint_expired", {});
+    return triggerResume("session_cap_fallback");
+  }
+  if (resumeInFlight) return;
+  resumeInFlight = true;
+  const t0 = performance.now();
+  try {
+    if (icebreaker) try { icebreaker.fadeIn(); } catch {}
+    await requestHandoffNote("session_cap");
+    pollAbortGen++;
+    activeToolCalls = 0;
+    // Claim missed work via a regular /api/resume call (this also marks any
+    // completed_while_away tasks delivered, so no double-replay).
+    const r = await fetch("/api/resume", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conv_id: convId }),
+    });
+    const claim = await r.json();
+    if (claim.expired) {
+      premintedSession = null;
+      premintedExpiresAt = null;
+      appendBubble("system", "Session expired. Tap Talk to start a new one.");
+      cleanupCall();
+      return;
+    }
+    if (dc) { try { dc.close(); } catch {} dc = null; }
+    if (pc) { try { pc.close(); } catch {} pc = null; }
+    // Use the pre-minted session for transport, but resume context (handoff
+    // note, recent_entries, completed_while_away, still_working) from claim.
+    const transport = { ...claim, session: premintedSession.session };
+    lastSessionConfig = premintedSession.session;
+    premintedSession = null;
+    premintedExpiresAt = null;
+    await attachPeer(transport, claim);
+    setStatus("connected", "live");
+    logClientEvent("client_session_cap_swap", { swap_ms: Math.round(performance.now() - t0) });
+  } catch (e) {
+    premintedSession = null;
+    premintedExpiresAt = null;
+    logClientEvent("client_session_cap_swap_failed", { error: String(e) });
+    triggerResume("session_cap_fallback");
+  } finally {
+    resumeInFlight = false;
+  }
+}
+
 async function triggerResume(reason, { silent = false } = {}) {
   if (!started || !convId || resumeInFlight) return;
   resumeInFlight = true;
   if (!silent) setStatus("resuming...", "thinking");
+  // Brown-noise bridge: keep the bed audible across the silent reconnect gap.
+  if (icebreaker) try { icebreaker.fadeIn(); } catch {}
   try {
+    // Generate a continuation note while the dying dc is still open. Best
+    // effort -- bounded by 2.5s and gated on responseInFlight.
+    await requestHandoffNote(reason);
+    // Abort any in-flight pollAgentTask loops bound to the dying call_ids;
+    // /api/resume's still_working list will re-attach them with callId=null.
+    pollAbortGen++;
+    activeToolCalls = 0;
     // Tear down the dead peer (don't call cleanupCall -- we want to keep
-    // started=true and clientEntries intact across the gap).
+    // started=true, clientEntries, deliveredTaskIds, and the icebreaker bed
+    // intact across the gap).
     if (dc) { try { dc.close(); } catch {} dc = null; }
     if (pc) { try { pc.close(); } catch {} pc = null; }
     const r = await fetch("/api/resume", {
@@ -487,6 +737,30 @@ function onDcMessage(ev) {
     case "session.created":
     case "session.updated":
       break;
+
+    case "response.created": {
+      responseInFlight = true;
+      // Bind any pending handoff request to this response.id so the
+      // text.delta/done events route to its buffer.
+      if (activeHandoffRequest && !activeHandoffRequest.responseId) {
+        activeHandoffRequest.responseId = msg.response?.id || null;
+      }
+      break;
+    }
+
+    case "response.text.delta": {
+      if (activeHandoffRequest && msg.response_id === activeHandoffRequest.responseId) {
+        activeHandoffRequest.buffer += msg.delta || "";
+      }
+      break;
+    }
+
+    case "response.text.done": {
+      if (activeHandoffRequest && msg.response_id === activeHandoffRequest.responseId) {
+        activeHandoffRequest.resolve(activeHandoffRequest.buffer);
+      }
+      break;
+    }
 
     case "response.audio_transcript.delta":
       assistantTextBuf += msg.delta || "";
@@ -571,6 +845,7 @@ function onDcMessage(ev) {
     }
 
     case "response.done":
+      responseInFlight = false;
       logClientEvent("client_response_done", {
         had_function_call: hadFunctionCallThisResponse,
         response_id: msg.response?.id || null,
@@ -661,8 +936,13 @@ async function handleAskAgent(callId, question) {
 // callId may be null on resume -- we still update the transcript/UI even when
 // there's no live realtime peer to feed.
 async function pollAgentTask(callId, taskId, question) {
+  // Capture the abort generation at spawn time. triggerResume bumps this
+  // counter so stale polls bound to the dying call_id self-terminate; the
+  // resume's still_working list re-attaches them with callId=null.
+  const myGen = pollAbortGen;
   while (true) {
     if (!convId) return "";
+    if (myGen !== pollAbortGen) return "";
     let data;
     try {
       const r = await fetch(`/api/agent-task/${encodeURIComponent(taskId)}?conv_id=${encodeURIComponent(convId)}`);
@@ -673,6 +953,7 @@ async function pollAgentTask(callId, taskId, question) {
       continue;
     }
     if (data.status === "running") continue;
+    if (myGen !== pollAbortGen) return "";
     deliveredTaskIds.add(taskId);
     const answer = data.answer || "";
     if (callId === null) {
@@ -758,9 +1039,9 @@ function cleanupCall() {
   micMuted = false;
   muteBtn.textContent = "\u{1F507}";
   if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
-  if (icebreaker) { try { icebreaker.fadeOut(); icebreaker.dispose(); } catch {} icebreaker = null; }
-  ambientBuffer = null;
-  if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
+  if (premintTimer) { clearTimeout(premintTimer); premintTimer = null; }
+  if (capSwapTimer) { clearTimeout(capSwapTimer); capSwapTimer = null; }
+  endIcebreaker();
   if (dc) { try { dc.close(); } catch {} dc = null; }
   if (pc) { try { pc.close(); } catch {} pc = null; }
   if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
@@ -772,6 +1053,12 @@ function cleanupCall() {
   turnTiming.firstTokenTs = null;
   connDownSinceTs = null;
   resumeInFlight = false;
+  responseInFlight = false;
+  activeHandoffRequest = null;
+  premintedSession = null;
+  premintedExpiresAt = null;
+  sessionStartedAt = null;
+  firstAudioFrameSeen = false;
   convId = null;
 }
 

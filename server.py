@@ -109,6 +109,47 @@ def _ensure_conv_shape(conv: Dict[str, Any]) -> None:
     conv.setdefault("agent_tasks", {})
     conv.setdefault("last_activity_ts", conv.get("started_at", time.time()))
 
+
+# Map every entry role we persist into the {user, assistant, system} space the
+# Realtime model accepts on conversation.item.create. Anything not in this map
+# is silently dropped from resume replay (system markers, unknowns, etc.).
+_ENTRY_ROLE_MAP: Dict[str, str] = {
+    "user": "user",
+    "assistant": "assistant",
+    "user_text": "user",
+    "assistant_text": "assistant",
+    "tool_question": "user",
+    "tool_answer": "assistant",
+}
+
+
+def _recent_entries(conv: Dict[str, Any], max_tokens: int = 3000) -> list[dict]:
+    """Return up to ~max_tokens of recent transcript entries, chronological,
+    with roles normalized into the Realtime model's {user, assistant} space.
+    Token estimate is len(text) // 4 — conservative for English."""
+    entries = conv.get("entries") or []
+    out: list[dict] = []
+    used = 0
+    for entry in reversed(entries):
+        role = _ENTRY_ROLE_MAP.get(entry.get("role"))
+        if not role:
+            continue
+        text = (entry.get("text") or "").strip()
+        if not text:
+            continue
+        tok = max(1, len(text) // 4)
+        if used + tok > max_tokens and out:
+            break
+        item = {"role": role, "text": text, "ts": entry.get("ts")}
+        task_id = entry.get("task_id")
+        if task_id:
+            item["task_id"] = task_id
+        out.append(item)
+        used += tok
+    out.reverse()
+    return out
+
+
 ASK_AGENT_TOOL_SCHEMA = {
     "type": "function",
     "name": "ask_agent",
@@ -603,9 +644,12 @@ async def resume_call(request: web.Request) -> web.Response:
                 "question": state["question"],
                 "elapsed_s": int(now - state["started_at"]),
             })
+    recent_entries = _recent_entries(conv)
     log_call_event(
         LOG_DIR, conv_id, "resumed",
         completed=len(completed_while_away), still_working=len(still_working),
+        handoff_note_chars=len(conv.get("handoff_note") or ""),
+        recent_entries=len(recent_entries),
     )
     return web.json_response({
         "conv_id": conv_id,
@@ -613,7 +657,57 @@ async def resume_call(request: web.Request) -> web.Response:
         "resumed": True,
         "completed_while_away": completed_while_away,
         "still_working": still_working,
+        "handoff_note": conv.get("handoff_note"),
+        "recent_entries": recent_entries,
     })
+
+
+async def premint_session(request: web.Request) -> web.Response:
+    """Pre-mint a fresh ephemeral for an existing conv ahead of the 60-min cap.
+
+    Does NOT touch conv state, does NOT mark any agent task delivered. The
+    actual swap-in fires a regular /api/resume call to claim missed work.
+    """
+    body = await request.json()
+    conv_id = body.get("conv_id")
+    conv = CONVERSATIONS.get(conv_id) if conv_id else None
+    if conv is None:
+        return web.json_response({"expired": True})
+    if not OPENAI_API_KEY:
+        return web.json_response({"error": "no_openai_key"}, status=500)
+    try:
+        data = await _mint_realtime_session()
+    except httpx.HTTPStatusError as e:
+        log.error("premint mint failed: %s %s", e.response.status_code, e.response.text[:300])
+        return web.json_response({"error": "ephemeral_mint_failed", "detail": e.response.text[:300]}, status=502)
+    except Exception as e:  # noqa: BLE001
+        log.exception("premint mint exception")
+        return web.json_response({"error": "ephemeral_mint_exception", "detail": str(e)}, status=502)
+    log_call_event(LOG_DIR, conv_id, "session_preminted")
+    return web.json_response({"conv_id": conv_id, "session": data})
+
+
+async def handoff_note(request: web.Request) -> web.Response:
+    """Persist the dying Realtime session's continuation note onto the conv,
+    so the next resume can splice it into the new session's instructions."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "bad_json"}, status=400)
+    conv_id = body.get("conv_id")
+    note = (body.get("note") or "").strip()
+    generated_in_ms = body.get("generated_in_ms")
+    conv = CONVERSATIONS.get(conv_id) if conv_id else None
+    if conv is None:
+        return web.json_response({"error": "no_conv"}, status=404)
+    if note:
+        conv["handoff_note"] = note
+        conv["handoff_note_ts"] = time.time()
+        log_call_event(
+            LOG_DIR, conv_id, "handoff_note_saved",
+            chars=len(note), generated_in_ms=generated_in_ms,
+        )
+    return web.json_response({"ok": True})
 
 
 def _cancel_in_flight_tasks(conv: dict) -> int:
@@ -776,6 +870,8 @@ def make_app() -> web.Application:
     app.router.add_get("/api/agent-task/{task_id}", agent_task)
     app.router.add_post("/api/text-turn", text_turn)
     app.router.add_post("/api/resume", resume_call)
+    app.router.add_post("/api/premint-session", premint_session)
+    app.router.add_post("/api/handoff-note", handoff_note)
     app.router.add_post("/api/end", end_call)
     # Static SPA - index.html and /static/*
     app.router.add_get("/", lambda r: web.FileResponse(HERE / "web" / "index.html"))
