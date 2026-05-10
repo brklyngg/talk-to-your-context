@@ -21,6 +21,7 @@ let pc = null;             // RTCPeerConnection
 let dc = null;             // data channel "oai-events"
 let micStream = null;
 let convId = null;
+let sessionMode = "default"; // "default" | "triage" — drives the first-response opener
 let started = false;
 let micMuted = false;
 let audioCtx = null;
@@ -388,6 +389,7 @@ async function startCall() {
     return;
   }
   convId = session.conv_id;
+  sessionMode = session.mode || "default";
   try {
     await attachPeer(session, null);
   } catch (e) {
@@ -427,9 +429,17 @@ function onDcOpen(resumeContext) {
   });
 
   if (!resumeContext) {
+    // First-turn opener depends on session mode. The hard-coded "Greet briefly"
+    // instruction primes the model into generic-assistant mode and overrides the
+    // triage doctrine baked into session-level instructions, so triage sessions
+    // need a mode-aware opener that points the model at the brief.
+    const openerInstructions =
+      sessionMode === "triage"
+        ? "Open the triage call: state loop [1]'s BLUF in <=8 words, then ask 'Drop, park, or act?'. Do not greet. Do not preamble. Do not call ask_agent — everything you need is in your system instructions."
+        : "Greet the user briefly in English. Just one sentence.";
     send({
       type: "response.create",
-      response: { output_modalities: ["audio"], instructions: "Greet the user briefly in English. Just one sentence." },
+      response: { output_modalities: ["audio"], instructions: openerInstructions },
     });
     return;
   }
