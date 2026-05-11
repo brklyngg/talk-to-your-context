@@ -15,6 +15,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -312,7 +313,12 @@ TRIAGE_VERDICT_TOOL_SCHEMA = {
 
 
 def _load_open_loops_brief() -> str | None:
-    """Load today's open-loops brief if fresh; else None.
+    """Load the open-loops triage brief.
+
+    When the on-disk brief is from a prior local date (e.g. first triage call
+    after midnight), serve it anyway with a staleness header — the same
+    pattern dossier.load_dossier() uses. Empty triage is worse than a
+    yesterday's-snapshot triage.
 
     Imports lazily so the open-loops repo is only required when actually used.
     """
@@ -321,9 +327,83 @@ def _load_open_loops_brief() -> str | None:
         if ol_path not in sys.path:
             sys.path.insert(0, ol_path)
         from brief_format import render  # type: ignore
-        return render()
+        import json
+        from datetime import datetime
+        from pathlib import Path
+        from zoneinfo import ZoneInfo
+        out = render()
+        if out:
+            return _triage_guardrails(out)
+        # render() returned None — could be missing file, empty bins, or
+        # (most likely on first call after midnight) a stale date gate. Read
+        # the file directly and try to recover with a staleness header.
+        path = Path.home() / ".hermes" / "open-loops" / "today.json"
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text())
+        gen_raw = data.get("generated_at")
+        if not gen_raw:
+            return None
+        ny = ZoneInfo("America/New_York")
+        try:
+            gen_date = datetime.fromisoformat(gen_raw).astimezone(ny).date()
+        except ValueError:
+            return None
+        # Spoof generated_at to now so render() bypasses its date gate, then
+        # prepend a staleness header so the model knows.
+        data["generated_at"] = datetime.now(ny).isoformat()
+        body = render(today=data)
+        if not body:
+            return None
+        return _triage_guardrails(body, stale_from=gen_date.isoformat())
     except Exception:
+        log.exception("open-loops brief load failed")
         return None
+
+
+_TRIAGE_GUARDRAILS = """\
+TRIAGE TOOL RULES — overrides toolkit defaults:
+- The context for every loop is RIGHT HERE in the brief (BLUF + source blob).
+  Read both fields. Don't fetch.
+- DO NOT call `lookup_open_loop` in triage mode. Those `ol_*` triage IDs are
+  NOT the Mission Control UUIDs `lookup_open_loop` expects; the call will fail.
+- DO NOT call `deep_research` for "let me get context on this loop" — the
+  triage call is a fast pass, not a research session.
+- DO NOT call `calendar`, `gmail_search`, `search_notes`, `recent_decisions`,
+  or `mission_control_card` for routine triage. Use only `triage_verdict`.
+- The only tool you should call in triage is `triage_verdict`, once per loop,
+  with the `ol_*` ID directly from the brief.
+- If a loop genuinely needs lookup before a verdict is possible, default-DROP
+  it and move on — that's already the doctrine. Don't research your way out.
+
+TRIAGE PRESENTATION (overrides the brief's "BLUF in <=8 words"):
+- Rule 9b (CONTEXT-SUFFICIENCY) wins. Gary has many parallel threads — a
+  fragment title is not enough for him to recall what a loop is about.
+- For each loop, before asking for a verdict, give 1–3 sentences of grounding
+  pulled from the loop's `BLUF`, `source_blob`, scoring metadata (age, score,
+  surfaced count), and surrounding signal: what it's about, why it surfaced,
+  what's open. Be concrete; quote distinctive phrasing from the source blob
+  if it helps disambiguate.
+- THEN ask for the verdict — phrased naturally for that specific loop, not
+  "drop, park, or act?" robotically. Example: "Want to kill this one, park it
+  for later, or do something with it now?"
+- If the BLUF is genuinely a thin fragment with no useful source_blob, SAY
+  THAT plainly ("the entry for this is just a fragment — want me to skip it
+  or pull it up?") rather than pretending it has meaning.
+"""
+
+
+def _triage_guardrails(body: str, *, stale_from: str | None = None) -> str:
+    """Prepend the triage tool-use guardrails (and a staleness header if the
+    brief was a yesterday's-snapshot fallback) to the rendered brief."""
+    pre = []
+    if stale_from:
+        pre.append(
+            f"> Triage brief — snapshot from {stale_from}; refresh in progress. "
+            f"Loop states may have shifted; verify before acting."
+        )
+    pre.append(_TRIAGE_GUARDRAILS.rstrip())
+    return "\n\n".join(pre) + "\n\n" + body
 
 
 # Optional deployment-specific facts the realtime model can rely on without
@@ -384,6 +464,20 @@ ANSWER-QUALITY RULES:
    fuzzy summary.
 9. Don't synthesize beyond what the tool returned. If the data isn't
    there, say it isn't there.
+9b. CONTEXT-SUFFICIENCY (load-bearing): the user is managing many parallel
+    threads simultaneously. When you introduce ANY item — an open loop, a
+    calendar event, an email, a card, a research finding, a draft for
+    review — assume he does NOT remember it cold from a one-line title or
+    summary. Before asking for a decision or proposing a next step, give
+    enough disambiguating context that he can place the item in his head:
+    what it's about, why it exists / how it surfaced, where it stands now,
+    and what's open about it. Then offer the decision options or next
+    step. Two to four sentences of grounding is usually right — not a
+    headline, not an essay. If the dossier/brief summary is a thin
+    fragment, expand it with what you can infer from surrounding context
+    or say plainly "the summary is thin; want me to look it up?" Never
+    lead with "Item N: drop, park, or act?" — that puts the cognitive
+    load on him instead of you.
 
 VERIFIED COMPLETION RULES:
 10. Don't say "done", "sent", "created", "updated", or "saved" unless a
@@ -513,6 +607,18 @@ async def health(request: web.Request) -> web.Response:
     })
 
 
+def _instructions_audit(suffixes: list[str | None] | None) -> tuple[int, str]:
+    """Compute (chars, sha1[:12]) of the exact instructions string the mint
+    would send. Mirrors the assembly in `_mint_realtime_session` so logged
+    hashes are directly comparable across calls."""
+    parts = [VOICE_SYSTEM_PROMPT]
+    for s in (suffixes or []):
+        if s and s.strip():
+            parts.append(s.strip())
+    s = "\n\n".join(parts)
+    return len(s), hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
+
+
 async def _mint_realtime_session(
     instructions_suffixes: list[str | None] | None = None,
 ) -> dict:
@@ -607,25 +713,27 @@ async def session_mint(request: web.Request) -> web.Response:
     # Dossier first (today's standing context); triage brief second when
     # opted in (mode-specific doctrine layered over the dossier).
     dossier_md, dossier_meta = dossier.load_dossier()
-    # Self-healing: when load returns None (missing or yesterday's date),
-    # kick a background refresh so the next session gets a fresh one.
-    # This mint stays unblocked — it serves without the dossier suffix.
-    if not dossier_meta["loaded"] and AGENT_API_KEY:
+    # Self-healing: kick a background refresh when the dossier is missing or
+    # stale (generated on a prior local date). The in-flight session still
+    # gets yesterday's snapshot with a staleness header so it has *some*
+    # standing context to orient on; the refresh updates disk for the next
+    # session.
+    if AGENT_API_KEY and (not dossier_meta["loaded"] or dossier_meta.get("stale")):
         log.info("dossier stale/missing at mint — kicking background refresh")
         asyncio.create_task(dossier.refresh_dossier(
             agent_base=AGENT_API_BASE, agent_key=AGENT_API_KEY, force=True,
         ))
     triage_suffix = _load_open_loops_brief() if mode == "triage" else None
+    suffixes = [dossier_md, triage_suffix]
     try:
-        data = await _mint_realtime_session(
-            instructions_suffixes=[dossier_md, triage_suffix],
-        )
+        data = await _mint_realtime_session(instructions_suffixes=suffixes)
     except httpx.HTTPStatusError as e:
         log.error("ephemeral mint failed: %s %s", e.response.status_code, e.response.text[:300])
         return web.json_response({"error": "ephemeral_mint_failed", "detail": e.response.text[:300]}, status=502)
     except Exception as e:  # noqa: BLE001
         log.exception("ephemeral mint exception")
         return web.json_response({"error": "ephemeral_mint_exception", "detail": str(e)}, status=502)
+    instructions_chars, instructions_hash = _instructions_audit(suffixes)
     log_call_event(
         LOG_DIR, conv_id, "session_minted",
         model=OPENAI_REALTIME_MODEL, voice=OPENAI_REALTIME_VOICE,
@@ -633,7 +741,10 @@ async def session_mint(request: web.Request) -> web.Response:
         dossier_loaded=dossier_meta["loaded"],
         dossier_chars=dossier_meta["chars"],
         dossier_age_h=dossier_meta["age_h"],
+        dossier_stale=dossier_meta.get("stale", False),
         working_state_present=dossier_meta["working_state_present"],
+        instructions_chars=instructions_chars,
+        instructions_hash=instructions_hash,
     )
     return web.json_response({"conv_id": conv_id, "session": data, "mode": mode or "default"})
 

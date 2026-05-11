@@ -985,13 +985,15 @@ async function handleNarrowTool(callId, name, args) {
 }
 
 // Streaming deep_research. Reads SSE, injects each `milestone` event into
-// the Realtime conversation as a system message so the voice model can
-// narrate progress between utterances. On `done`, feeds the assembled
-// answer as the function_call_output.
+// the Realtime conversation as a system message AND fires an out-of-band
+// `response.create` so the voice model audibly narrates the finding rather
+// than going silent for the full agent-backend duration. On `done`, feeds
+// the assembled answer as the function_call_output.
 async function handleDeepResearch(callId, args) {
   const prompt = (args && args.prompt) || "";
   let assembled = "";
   let lastMilestoneInjectedTs = 0;
+  let lastNarrationTs = 0;
   let chipEntry = consultingChips.get(callId);
 
   function injectMilestone(section, text) {
@@ -1002,6 +1004,7 @@ async function handleDeepResearch(callId, args) {
     if (now - lastMilestoneInjectedTs < 1500) return;
     lastMilestoneInjectedTs = now;
     try {
+      // 1. Append the finding to conversation history (silent — no response).
       dc.send(JSON.stringify({
         type: "conversation.item.create",
         item: {
@@ -1010,6 +1013,26 @@ async function handleDeepResearch(callId, args) {
             text: `[research-finding] section=${section}: ${text}` }],
         },
       }));
+      // 2. Out-of-band response.create so the model audibly narrates the
+      //    finding without polluting the main conversation history or
+      //    interrupting the pending function call. Throttled separately
+      //    from milestone ingestion — narrating every milestone would be
+      //    too chatty; ~10s between spoken updates is the floor.
+      if (now - lastNarrationTs >= 10000) {
+        lastNarrationTs = now;
+        dc.send(JSON.stringify({
+          type: "response.create",
+          response: {
+            conversation: "none",
+            output_modalities: ["audio"],
+            instructions:
+              `Briefly tell Gary what you just found, in one short sentence. ` +
+              `Section: ${section}. Finding: ${text}. ` +
+              `Don't summarize the whole research — just this one update. ` +
+              `Stay conversational; don't restate the user's question.`,
+          },
+        }));
+      }
     } catch {}
     if (chipEntry) updateConsultingChip(chipEntry.chipDiv, `Researching · ${section}: ${text}`);
   }

@@ -196,28 +196,43 @@ def render_markdown(d: dict | None) -> str:
 def load_dossier() -> tuple[str | None, dict]:
     """Return (markdown_suffix_or_None, meta).
 
-    `markdown_suffix_or_None` is the rendered prompt suffix if the dossier
-    is from today's local date; None otherwise (so mint can fall back to a
-    plain session). `meta` always returns the audit fields the caller logs:
+    When the on-disk dossier is from today's local date, the suffix is returned
+    as-is. When the dossier is stale (generated on a prior local date — e.g.
+    the first call after midnight), the suffix is still returned but prefixed
+    with a staleness header so the in-flight session has *some* standing
+    context. The mint pathway separately kicks a background refresh; this
+    function only governs what the current session sees.
+
+    `meta` always returns the audit fields the caller logs:
     `loaded` (bool), `chars` (int), `age_h` (float|None),
-    `working_state_present` (bool).
+    `working_state_present` (bool), `stale` (bool).
     """
     d = _read_disk()
     meta: dict[str, Any] = {
-        "loaded": False, "chars": 0, "age_h": None, "working_state_present": False,
+        "loaded": False, "chars": 0, "age_h": None,
+        "working_state_present": False, "stale": False,
     }
     if not d or not d.get("generated_at"):
         return None, meta
     gen_at = float(d["generated_at"])
     meta["age_h"] = round(_age_hours(gen_at), 2)
-    if _generated_local_date(gen_at) != _today_local():
-        return None, meta
+    gen_date = _generated_local_date(gen_at)
+    today = _today_local()
     suffix = render_markdown(d)
     if not suffix:
         return None, meta
+    stale = gen_date != today
+    if stale:
+        suffix = (
+            f"> Standing context — snapshot from {gen_date.isoformat()}; "
+            f"today's regen is in progress. Use this for orientation; "
+            f"verify time-sensitive details (today's calendar, latest open-loop "
+            f"states) before relying on them.\n\n"
+        ) + suffix
     ws = d.get("working_state_from_last_call") or {}
     meta["loaded"] = True
     meta["chars"] = len(suffix)
+    meta["stale"] = stale
     meta["working_state_present"] = any(
         ws.get(k) for k in ("decisions", "commitments", "open_questions", "deltas")
     )
