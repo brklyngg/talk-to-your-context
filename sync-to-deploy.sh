@@ -67,7 +67,16 @@ echo "patching $env_file"
 add_if_missing AGENT_API_BASE '${HERMES_BASE:-http://127.0.0.1:8642}'
 add_if_missing ASK_AGENT_TIMEOUT_SEC '600'
 add_if_missing ASK_AGENT_IDLE_TIMEOUT_SEC '45'
-add_if_missing AGENT_DEPLOYMENT_NOTE 'You run on Gary'\''s Mac Mini. The agent backend (Hermes) has full filesystem access -- it can write files anywhere including ~/Desktop and the Obsidian vault. The diagnostic log lives at ~/.hermes-custom/hermes-mini/logs/calls/<conv_id>.ndjson. Voice = gpt-realtime-2. Brain = gpt-5.5 via Codex OAuth, with Ollama Gemma-4-E4B and OpenRouter Gemini-3.1-Pro fallbacks. If asked anything about logs, models, file capabilities, or where data lives -- call ask_agent. Do not improvise.'
+add_if_missing AGENT_DEPLOYMENT_NOTE 'You run on Gary'\''s Mac Mini. Voice = gpt-realtime-2 (you). Agent backend (Hermes) = gpt-5.5 via Codex OAuth -- reached via deep_research. The agent has FULL filesystem access (writes anywhere including ~/Desktop and the Obsidian vault), Gmail draft, and Calendar write tools. For any "save this", "write this to a file", "draft this email", "add to calendar" request: call deep_research with scope="action" and the agent will execute it and return a concrete handle. Diagnostic logs: ~/.hermes-custom/hermes-mini/logs/calls/<conv_id>.ndjson. Dossier: ~/.hermes/dossier/today.json.'
+
+# One-time rewrite for installs that still carry the pre-cutover note that
+# instructs the model to "call ask_agent" — which no longer exists. Idempotent.
+if grep -q 'call ask_agent' "$env_file"; then
+  sed -i.bak '/^AGENT_DEPLOYMENT_NOTE=/d' "$env_file"
+  rm -f "$env_file.bak"
+  add_if_missing AGENT_DEPLOYMENT_NOTE 'You run on Gary'\''s Mac Mini. Voice = gpt-realtime-2 (you). Agent backend (Hermes) = gpt-5.5 via Codex OAuth -- reached via deep_research. The agent has FULL filesystem access (writes anywhere including ~/Desktop and the Obsidian vault), Gmail draft, and Calendar write tools. For any "save this", "write this to a file", "draft this email", "add to calendar" request: call deep_research with scope="action" and the agent will execute it and return a concrete handle. Diagnostic logs: ~/.hermes-custom/hermes-mini/logs/calls/<conv_id>.ndjson. Dossier: ~/.hermes/dossier/today.json.'
+  echo "  ~ AGENT_DEPLOYMENT_NOTE rewritten (was pre-cutover note referencing ask_agent)"
+fi
 
 # Bump model to gpt-realtime-2 if still pinned to the legacy name (May 2026
 # cutover). Idempotent — does nothing if already gpt-realtime-2 or unset.

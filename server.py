@@ -231,20 +231,40 @@ DEEP_RESEARCH_TOOL_SCHEMA = {
     "type": "function",
     "name": "deep_research",
     "description": (
-        "Slow agent loop for novel multi-step reasoning, drafting, or synthesis "
-        "no narrow tool covers. Typically 30–240 seconds. Tell the user roughly "
+        "Slow agent path for anything no narrow tool covers — including ACTIONS "
+        "with side effects (write/save files, draft and save emails, create "
+        "calendar events, edit notes, run scripts) AND novel reasoning, "
+        "drafting, or synthesis. The agent backend has full filesystem access, "
+        "Gmail draft / Calendar write, and shell tools — use this tool for any "
+        "user request that requires *doing* something on Gary's Mac, not just "
+        "looking something up. Typically 30–240 seconds. Tell the user roughly "
         "how long ('this'll take about a minute, I'll narrate as I go'). Partial "
         "findings stream in via `[research-finding]` system messages — narrate "
-        "them; don't claim completion until you receive the function_call_output."
+        "them; don't claim completion until you receive the function_call_output. "
+        "When the work includes an action, the function_call_output will include "
+        "a concrete handle (file path, message id, event link) — only then say 'done'."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "prompt": {"type": "string", "description": "Full natural-language request, with context"},
+            "prompt": {
+                "type": "string",
+                "description": (
+                    "Full natural-language request, with all relevant context. "
+                    "For actions, state the goal AND the success criteria — e.g. "
+                    "'Save this draft to ~/Desktop/foo.md and tell me the final path.' "
+                    "The agent will interpret and execute; you don't need to "
+                    "describe how."
+                ),
+            },
             "scope": {
                 "type": "string",
-                "enum": ["drafting", "reasoning", "synthesis"],
-                "description": "Why this needs the slow path",
+                "enum": ["action", "drafting", "reasoning", "synthesis"],
+                "description": (
+                    "action: side-effecting work (filesystem, email draft, "
+                    "calendar). drafting: write a document/message. reasoning: "
+                    "novel multi-step thinking. synthesis: combine sources."
+                ),
             },
             "expected_seconds": {
                 "type": "integer",
@@ -324,48 +344,58 @@ calendar, recent decisions, hot people, and the working state from your
 previous call. ADDRESS IT DIRECTLY — don't re-fetch what's already there.
 
 TOOLKIT:
-- Narrow tools (sub-second): `lookup_open_loop`, `recent_decisions`,
+- Narrow read tools (sub-second): `lookup_open_loop`, `recent_decisions`,
   `search_notes`, `calendar`, `gmail_search`, `mission_control_card`.
-- One slow tool: `deep_research` — novel reasoning, drafting, or synthesis
-  no narrow tool covers. 30–240 seconds.
+- One slow tool: `deep_research` — covers BOTH (a) novel reasoning,
+  drafting, synthesis, AND (b) any ACTION with side effects: write/save
+  files, draft and save emails, create calendar events, edit notes, run
+  scripts. The agent backend has full filesystem access, Gmail draft /
+  Calendar write, and shell tools. Use this tool for any "do X for me"
+  request, not just "think about X."
 
 TOOL-CALL DOCTRINE:
-1. Prefer the narrowest applicable tool over `deep_research`. For factual
-   lookups (calendar, email, notes, cards, decisions), the narrow tool is
-   always right.
-2. Fan out small tools in parallel when a single turn needs multiple. The
-   API supports it; use it — don't serialize "let me check your calendar…
-   ok now let me check your email."
-3. Prefer in-session reasoning when the answer is already in the dossier
+1. Prefer the narrowest applicable read tool for factual lookups (calendar,
+   email, notes, cards, decisions). Don't escalate read-only questions to
+   `deep_research`.
+2. Any user request that requires *doing* something (saving a file,
+   drafting an email and saving it, creating a calendar event, editing
+   a note, etc.) goes through `deep_research` with scope="action". The
+   agent will perform the action and return a concrete handle.
+3. Fan out small tools in parallel when a single turn needs multiple
+   lookups. The API supports it — don't serialize "let me check your
+   calendar… ok now let me check your email."
+4. Prefer in-session reasoning when the answer is already in the dossier
    or a prior tool result this call. Don't re-fetch what's in your context.
-4. `deep_research` is the slow path. When you call it: TELL the user
+5. `deep_research` is the slow path. When you call it: TELL the user
    roughly how long ("this'll take about a minute, I'll narrate as I go").
    Partial findings stream in as `[research-finding] section=…` system
    messages — narrate them as they arrive; don't claim completion until
    you receive the function_call_output.
-5. ANTI-FABRICATION: never invent user-specific facts. If you're unsure
+6. ANTI-FABRICATION: never invent user-specific facts. If you're unsure
    whether the dossier or a prior tool result covers a name, date, file,
    commitment, or decision, escalate to a tool rather than guess. "I'd
    need to check" beats a confident wrong answer; a tool call is better.
 
 ANSWER-QUALITY RULES:
-6. If a tool returns `{"error": …}`, say so plainly ("I couldn't reach
+7. If a tool returns `{"error": …}`, say so plainly ("I couldn't reach
    your calendar — try again in a sec"). Never invent a fallback.
-7. If a tool returns a list, enumerate briefly first ("you have three:
+8. If a tool returns a list, enumerate briefly first ("you have three:
    A, B, C"), then synthesize. Don't blend distinct items into one
    fuzzy summary.
-8. Don't synthesize beyond what the tool returned. If the data isn't
+9. Don't synthesize beyond what the tool returned. If the data isn't
    there, say it isn't there.
 
 VERIFIED COMPLETION RULES:
-9. Don't say "done", "sent", "created", "updated", or "saved" unless a
-   tool response included a concrete handle — a file path, ID, link, or
-   timestamp confirming the action. Drafted ≠ done.
+10. Don't say "done", "sent", "created", "updated", or "saved" unless a
+    tool response included a concrete handle — a file path, ID, link, or
+    timestamp confirming the action. Drafted ≠ done. If you asked for an
+    action via `deep_research` and the response didn't include a handle,
+    say "I asked for it" rather than "done."
 
 STYLE RULES:
-10. Lead with the answer — the number, the time, the yes/no, the decision.
+11. Lead with the answer — the number, the time, the yes/no, the decision.
     Reasons after, only if asked or load-bearing.
-11. Phone-call tempo: ≤2 sentences per turn unless asked for more. Numbers
+12. Phone-call tempo: ≤2 sentences per turn unless asked for more. Numbers
     spoken naturally ("ten thirty", not "10:30 colon zero zero").
 
 CAPABILITIES (TRUTH — DO NOT CONTRADICT):
@@ -577,6 +607,14 @@ async def session_mint(request: web.Request) -> web.Response:
     # Dossier first (today's standing context); triage brief second when
     # opted in (mode-specific doctrine layered over the dossier).
     dossier_md, dossier_meta = dossier.load_dossier()
+    # Self-healing: when load returns None (missing or yesterday's date),
+    # kick a background refresh so the next session gets a fresh one.
+    # This mint stays unblocked — it serves without the dossier suffix.
+    if not dossier_meta["loaded"] and AGENT_API_KEY:
+        log.info("dossier stale/missing at mint — kicking background refresh")
+        asyncio.create_task(dossier.refresh_dossier(
+            agent_base=AGENT_API_BASE, agent_key=AGENT_API_KEY, force=True,
+        ))
     triage_suffix = _load_open_loops_brief() if mode == "triage" else None
     try:
         data = await _mint_realtime_session(

@@ -53,6 +53,8 @@ node --check web/app.js
 | `calendar(when, account)` | ~500ms | function | `backends.gws` (gws-as.sh) |
 | `gmail_search(query, account, limit)` | 500–1500ms | function | `backends.gws` |
 | `deep_research(prompt, scope, expected_seconds)` | 30–240s | SSE | agent backend |
+
+`deep_research` covers both *thinking* (reasoning/drafting/synthesis) and *doing* (actions with side effects: filesystem writes, Gmail drafts, Calendar writes, scripts) — the agent backend has the tools. Scope arg is `action|drafting|reasoning|synthesis`. For "save this to ~/Desktop/foo.md" or similar, the model calls `deep_research` with `scope=action` and the agent executes.
 | `triage_verdict(loop_id, verdict, …)` | <50ms | function | `/api/triage-verdict` |
 
 Per-tool TTL cache in `server.py:_TOOL_TTL` keyed on `(tool, args_hash)` via `backends/cache.py`.
@@ -66,7 +68,7 @@ Per-tool TTL cache in `server.py:_TOOL_TTL` keyed on `(tool, args_hash)` via `ba
 **Dossier refresh + post-call working-state extraction:**
 - `dossier.refresh_dossier()`: one agent call with a JSON-only directive → atomic write to `DOSSIER_PATH`. 30-min debounce; `force=True` bypasses. Schema: `{open_loops, calendar_today, recent_decisions, hot_people, last_handoff_summary, working_state_from_last_call}`.
 - `dossier.extract_working_state(conv_id, entries)`: one agent call after a call ends → `{decisions, commitments, open_questions, deltas}` merged into the dossier. This is the cross-call continuity loop — the next session's instructions carry what we just decided/committed/learned.
-- Local-date gating (`DOSSIER_TZ`, default America/New_York): yesterday's dossier is treated as stale at mint time. Mint never blocks on dossier; reads whatever's on disk.
+- Local-date gating (`DOSSIER_TZ`, default America/New_York): yesterday's dossier is treated as stale at mint time. Mint never blocks on dossier; reads whatever's on disk. When the on-disk dossier is stale or missing, mint fires a background `refresh_dossier(force=True)` so the next session lands with a fresh one (self-healing on day rollover).
 
 **`triage_verdict` (opt-in via `?mode=triage`):**
 - `_load_open_loops_brief()` lazy-imports `~/.hermes-custom/open-loops/brief_format.py`, appends as a second suffix layered over the dossier. Client routes `triage_verdict` function_calls to `POST /api/triage-verdict`. Reconcile cron (open-loops repo) creates `[Hermes Draft]`-prefixed calendar events for `act` verdicts. Open-loops repo is optional — lazy import returns `None` on failure.
