@@ -33,6 +33,7 @@ HERE = Path(__file__).parent
 load_dotenv(HERE / ".env")
 
 from auth import tailnet_middleware  # noqa: E402
+import dossier  # noqa: E402
 from events import log_call_event, compute_routing_metrics  # noqa: E402
 from transcripts import write_transcript, ingest_into_agent, post_to_slack  # noqa: E402
 
@@ -103,48 +104,166 @@ def _ensure_conv_shape(conv: Dict[str, Any]) -> None:
     conv.setdefault("last_activity_ts", conv.get("started_at", time.time()))
 
 
-ASK_AGENT_TOOL_SCHEMA = {
+# Granular tool schemas. Each fans out to a direct backend (Supabase / gws /
+# Obsidian fs) and returns small structured JSON — no LLM in the dispatch
+# path. The model prefers these over `deep_research` for any factual lookup;
+# `deep_research` is reserved for novel reasoning, drafting, or synthesis no
+# narrow tool covers.
+LOOKUP_OPEN_LOOP_SCHEMA = {
     "type": "function",
-    "name": "ask_agent",
+    "name": "lookup_open_loop",
     "description": (
-        "Consult the backend agent for context you don't already have from "
-        "this call: external/current facts (calendar, email, files, web), "
-        "cross-session memory, verification, drafting, or novel reasoning. "
-        "Do NOT call for clarifications, recaps, comparisons, or refinements "
-        "of context already in this call - answer those directly."
+        "Look up a single open loop / Mission Control card by its UUID. Prefer "
+        "this over `deep_research` whenever the user references a specific loop. "
+        "The dossier in your instructions lists today's open loops with IDs."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "question": {
-                "type": "string",
-                "description": (
-                    "The question or request to send to the agent, in full natural "
-                    "language. Include relevant context from the conversation."
-                ),
-            },
-            "intent_type": {
-                "type": "string",
-                "enum": ["lookup", "action", "drafting", "reasoning", "verification", "other"],
-                "description": (
-                    "Why you are escalating: lookup (memory/calendar/email/files), "
-                    "action (the user wants something done), drafting (write/compose), "
-                    "reasoning (novel multi-step thinking), verification (confirm a "
-                    "fact's freshness or current state), other."
-                ),
-            },
-            "freshness_required": {
-                "type": "boolean",
-                "description": (
-                    "True if the answer must reflect the current external state "
-                    "(today's calendar, latest email, current file contents, etc.). "
-                    "False if a recent cached answer would be acceptable."
-                ),
-            },
+            "id": {"type": "string", "description": "Card UUID (e.g. from §open_loops in the dossier)"},
         },
-        "required": ["question", "intent_type", "freshness_required"],
+        "required": ["id"],
     },
 }
+
+RECENT_DECISIONS_SCHEMA = {
+    "type": "function",
+    "name": "recent_decisions",
+    "description": (
+        "List recent decisions / committed actions from the journal. Use for "
+        "'what did we decide about X' or 'what's been going on this week.' "
+        "Returns structured rows you can quote directly."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "days": {"type": "integer", "description": "Look-back window (1–30)", "default": 7},
+        },
+        "required": [],
+    },
+}
+
+SEARCH_NOTES_SCHEMA = {
+    "type": "function",
+    "name": "search_notes",
+    "description": (
+        "Full-text search the user's Obsidian vault. Use for 'what did I write "
+        "about X', 'find the note on Y', or to surface adjacent context. "
+        "Returns top-k matches with snippets."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "k": {"type": "integer", "description": "Max results (1–20)", "default": 5},
+        },
+        "required": ["query"],
+    },
+}
+
+CALENDAR_SCHEMA = {
+    "type": "function",
+    "name": "calendar",
+    "description": (
+        "Read calendar events for a window. Use for 'what's on for today', "
+        "'tomorrow's meetings', or specific dates. Always prefer this over "
+        "`deep_research` for scheduling questions."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "when": {
+                "type": "string",
+                "description": (
+                    "Accepted: 'today', 'tomorrow', 'this week', YYYY-MM-DD, "
+                    "or 'YYYY-MM-DD/YYYY-MM-DD' for a range. Defaults to today."
+                ),
+            },
+            "account": {
+                "type": "string",
+                "description": "One of: gurevich.gary@gmail.com, gary@crunchy.tools, gary@flowocity.ai. Defaults to personal.",
+            },
+        },
+        "required": [],
+    },
+}
+
+GMAIL_SEARCH_SCHEMA = {
+    "type": "function",
+    "name": "gmail_search",
+    "description": (
+        "Search Gmail with a query. Use Gmail's native search syntax "
+        "(`from:foo`, `subject:bar`, `newer_than:3d`). Returns top messages "
+        "with from/subject/snippet."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Gmail search syntax"},
+            "account": {
+                "type": "string",
+                "description": "One of: gurevich.gary@gmail.com, gary@crunchy.tools, gary@flowocity.ai.",
+            },
+            "limit": {"type": "integer", "description": "Max results (1–25)", "default": 10},
+        },
+        "required": ["query"],
+    },
+}
+
+MISSION_CONTROL_CARD_SCHEMA = {
+    "type": "function",
+    "name": "mission_control_card",
+    "description": (
+        "Fuller view of a Mission Control card: title, status, description, "
+        "extended context, position. Use when you need more detail than "
+        "`lookup_open_loop` returns."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "Card UUID"},
+        },
+        "required": ["id"],
+    },
+}
+
+DEEP_RESEARCH_TOOL_SCHEMA = {
+    "type": "function",
+    "name": "deep_research",
+    "description": (
+        "Slow agent loop for novel multi-step reasoning, drafting, or synthesis "
+        "no narrow tool covers. Typically 30–240 seconds. Tell the user roughly "
+        "how long ('this'll take about a minute, I'll narrate as I go'). Partial "
+        "findings stream in via `[research-finding]` system messages — narrate "
+        "them; don't claim completion until you receive the function_call_output."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string", "description": "Full natural-language request, with context"},
+            "scope": {
+                "type": "string",
+                "enum": ["drafting", "reasoning", "synthesis"],
+                "description": "Why this needs the slow path",
+            },
+            "expected_seconds": {
+                "type": "integer",
+                "description": "Your honest estimate; used for user expectations",
+            },
+        },
+        "required": ["prompt", "scope", "expected_seconds"],
+    },
+}
+
+TOOLKIT_SCHEMAS = [
+    LOOKUP_OPEN_LOOP_SCHEMA,
+    RECENT_DECISIONS_SCHEMA,
+    SEARCH_NOTES_SCHEMA,
+    CALENDAR_SCHEMA,
+    GMAIL_SEARCH_SCHEMA,
+    MISSION_CONTROL_CARD_SCHEMA,
+    DEEP_RESEARCH_TOOL_SCHEMA,
+]
 
 
 TRIAGE_VERDICT_TOOL_SCHEMA = {
@@ -193,63 +312,66 @@ def _load_open_loops_brief() -> str | None:
 # its own capabilities. Leave empty for the generic public scaffold.
 AGENT_DEPLOYMENT_NOTE = os.getenv("AGENT_DEPLOYMENT_NOTE", "").strip()
 
-# Tool-call routing prompt. Tightened May 2026 for gpt-realtime-2 GA: the
-# model has GPT-5-class reasoning and 128K context, plus native preambles
-# ("let me check that") and async function calling that keep the conversation
-# flowing during tool waits — so the prior hand-coded bridging rules are gone,
-# replaced by a stronger bias toward in-session answers and a sharper anti-
-# fabrication line.
+# Tool-call routing prompt. Rewritten May 2026 for the granular toolkit cutover:
+# narrow tools hit direct backends (sub-second), `deep_research` is the only
+# slow path. gpt-realtime-2's native parallel function calling means small
+# lookups should fan out, not serialize. The dossier in your instructions
+# carries today's standing context — address it directly.
 _BASE_PROMPT = """\
-You are a live voice assistant with access to the user's deep context via
-the ask_agent tool, which routes to a backend agent loop with the user's
-full memory, skills, calendar, email, files, and external integrations.
+You are a live voice assistant with deep context about the user. Your
+DOSSIER (appended to these instructions) carries today's open loops,
+calendar, recent decisions, hot people, and the working state from your
+previous call. ADDRESS IT DIRECTLY — don't re-fetch what's already there.
 
-CRITICAL TOOL-CALL RULES:
-1. Prefer answering from in-session context. If the user's turn can be
-   fully answered from a prior ask_agent answer in this same call, or is a
-   clarification, recap, comparison, refinement, or follow-up reasoning on
-   context already established here, answer directly. Trust your reasoning;
-   prior tool answers are in your context window — use them.
-2. Call ask_agent ONLY when the answer requires something you do NOT already
-   have: external/current facts (calendar, email, files, web), cross-session
-   memory ("what did we say last time"), verification of freshness, drafting
-   that needs the user's durable voice, novel reasoning that benefits from
-   agent skills, or any user-specific fact not yet established here.
-3. ANTI-FABRICATION: never invent user-specific facts. If you are unsure
-   whether your in-session context actually covers a name, date, file,
-   commitment, or decision the user is asking about, escalate via ask_agent
-   rather than guess. A clean "I'd need to check" is better than a confident
-   wrong answer; a tool call is better still.
+TOOLKIT:
+- Narrow tools (sub-second): `lookup_open_loop`, `recent_decisions`,
+  `search_notes`, `calendar`, `gmail_search`, `mission_control_card`.
+- One slow tool: `deep_research` — novel reasoning, drafting, or synthesis
+  no narrow tool covers. 30–240 seconds.
+
+TOOL-CALL DOCTRINE:
+1. Prefer the narrowest applicable tool over `deep_research`. For factual
+   lookups (calendar, email, notes, cards, decisions), the narrow tool is
+   always right.
+2. Fan out small tools in parallel when a single turn needs multiple. The
+   API supports it; use it — don't serialize "let me check your calendar…
+   ok now let me check your email."
+3. Prefer in-session reasoning when the answer is already in the dossier
+   or a prior tool result this call. Don't re-fetch what's in your context.
+4. `deep_research` is the slow path. When you call it: TELL the user
+   roughly how long ("this'll take about a minute, I'll narrate as I go").
+   Partial findings stream in as `[research-finding] section=…` system
+   messages — narrate them as they arrive; don't claim completion until
+   you receive the function_call_output.
+5. ANTI-FABRICATION: never invent user-specific facts. If you're unsure
+   whether the dossier or a prior tool result covers a name, date, file,
+   commitment, or decision, escalate to a tool rather than guess. "I'd
+   need to check" beats a confident wrong answer; a tool call is better.
 
 ANSWER-QUALITY RULES:
-4. If you don't have the info or aren't confident, say so directly. "I don't
-   have that" or "I'd need to check" beats a guess.
-5. Don't synthesize beyond what ask_agent returned. If the agent said it
-   doesn't know, say you don't know. Don't fill gaps.
-6. If ask_agent returns a list (meetings, emails, files, options), enumerate
-   briefly first — "You have three: A, B, and C" — then synthesize. Don't
-   blend distinct items into one fuzzy summary.
+6. If a tool returns `{"error": …}`, say so plainly ("I couldn't reach
+   your calendar — try again in a sec"). Never invent a fallback.
+7. If a tool returns a list, enumerate briefly first ("you have three:
+   A, B, C"), then synthesize. Don't blend distinct items into one
+   fuzzy summary.
+8. Don't synthesize beyond what the tool returned. If the data isn't
+   there, say it isn't there.
 
 VERIFIED COMPLETION RULES:
-7. Don't say "done", "sent", "created", "updated", or "saved" unless
-   ask_agent's answer included a concrete handle — a file path, ID, link,
-   or timestamp confirming the action. If the agent queued or drafted
-   something, say "I asked for it" or "drafted", not "done".
+9. Don't say "done", "sent", "created", "updated", or "saved" unless a
+   tool response included a concrete handle — a file path, ID, link, or
+   timestamp confirming the action. Drafted ≠ done.
 
 STYLE RULES:
-8. Lead with the answer — the number, the time, the yes/no, the decision.
-   Reasons after, only if asked or load-bearing.
-9. Phone-call tempo: ≤2 sentences per turn unless asked for more. Numbers
-   spoken naturally ("ten thirty", not "10:30 colon zero zero").
-
-TOOL-FAILURE HONESTY:
-10. If ask_agent's answer starts with "Agent is temporarily unreachable" or
-    is empty, say so plainly and ask the user to repeat. Never invent.
+10. Lead with the answer — the number, the time, the yes/no, the decision.
+    Reasons after, only if asked or load-bearing.
+11. Phone-call tempo: ≤2 sentences per turn unless asked for more. Numbers
+    spoken naturally ("ten thirty", not "10:30 colon zero zero").
 
 CAPABILITIES (TRUTH — DO NOT CONTRADICT):
-- Questions about your model, voice, logs, file capabilities, or where data
-  lives must be answered via ask_agent. The agent knows its own setup; you
-  do not. Do not improvise refusals like "I don't have access to that".
+- Questions about your model, voice, logs, or where data lives can be
+  answered via `deep_research` if the dossier doesn't cover them. Don't
+  improvise refusals like "I don't have access to that".
 
 LANGUAGE:
 - Always speak English unless the user explicitly switches mid-conversation.
@@ -272,25 +394,24 @@ def _new_conv_id() -> str:
     return secrets.token_urlsafe(12)
 
 
-async def _agent_chat_inner(conv_id: str, user_text: str) -> str:
-    """Forward a single user turn to the backend agent and return the full text.
+async def _agent_chat_stream(conv_id: str, user_text: str):
+    """Async generator yielding agent SSE chunks as they arrive.
 
-    The backend speaks chat-completions SSE; we consume the stream and assemble
-    the answer. Total wall time is capped by ``_agent_chat`` via asyncio.wait_for,
-    so this inner does not need its own total-timeout guard.
+    Used by `/api/deep-research` to emit section milestones mid-stream and
+    by `_agent_chat_collect` to assemble a final string (dossier refresh,
+    post-call extraction, /api/text-turn).
+
+    Liveness model:
+      - httpx `read` timeout = ASK_AGENT_IDLE_TIMEOUT_SEC (raises ReadTimeout
+        if the backend goes silent mid-stream).
+      - Caller wraps in asyncio.wait_for(ASK_AGENT_TIMEOUT_SEC) for the outer
+        runaway guard.
     """
     if not AGENT_API_KEY:
         raise RuntimeError("Agent API key not configured")
-    # `read` is the idle-gap watchdog: max time between SSE bytes from the
-    # backend. If the backend goes silent, httpx raises ReadTimeout. Total
-    # wall time is bounded separately by `_agent_chat`.
     timeout = httpx.Timeout(
-        connect=10.0,
-        read=ASK_AGENT_IDLE_TIMEOUT_SEC,
-        write=10.0,
-        pool=10.0,
+        connect=10.0, read=ASK_AGENT_IDLE_TIMEOUT_SEC, write=10.0, pool=10.0,
     )
-    chunks: list[str] = []
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream(
             "POST",
@@ -321,15 +442,21 @@ async def _agent_chat_inner(conv_id: str, user_text: str) -> str:
                 delta = (evt.get("choices") or [{}])[0].get("delta") or {}
                 piece = delta.get("content") or ""
                 if piece:
-                    chunks.append(piece)
+                    yield piece
+
+
+async def _agent_chat_collect(conv_id: str, user_text: str) -> str:
+    """Drain the stream into a single string. Idle/timeout exceptions bubble."""
+    chunks: list[str] = []
+    async for piece in _agent_chat_stream(conv_id, user_text):
+        chunks.append(piece)
     return "".join(chunks)
 
 
 async def _agent_chat(conv_id: str, user_text: str) -> str:
-    """Cap the inner forward at ASK_AGENT_TIMEOUT_SEC. Raises asyncio.TimeoutError
-    on overrun — caller maps that to the structured-unreachable sentinel."""
+    """Cap at ASK_AGENT_TIMEOUT_SEC. Raises asyncio.TimeoutError on overrun."""
     return await asyncio.wait_for(
-        _agent_chat_inner(conv_id, user_text),
+        _agent_chat_collect(conv_id, user_text),
         timeout=ASK_AGENT_TIMEOUT_SEC,
     )
 
@@ -356,21 +483,25 @@ async def health(request: web.Request) -> web.Response:
     })
 
 
-async def _mint_realtime_session(instructions_suffix: str | None = None) -> dict:
+async def _mint_realtime_session(
+    instructions_suffixes: list[str | None] | None = None,
+) -> dict:
     """Mint an OpenAI Realtime ephemeral session. Raises on HTTP/network error.
 
     Uses the May 2026 GA endpoint (/v1/realtime/client_secrets). The session
     config is nested under ``session`` and audio under ``audio.input`` /
-    ``audio.output``. ``instructions_suffix`` is appended to ``VOICE_SYSTEM_PROMPT``
-    so a handoff-note continuation can be baked into the freshly-minted
-    instructions on resume.
+    ``audio.output``. ``instructions_suffixes`` is a list of optional suffixes
+    appended in order to ``VOICE_SYSTEM_PROMPT`` (``None``/empty entries are
+    skipped). Typical compose: ``[dossier_md, triage_brief?, handoff_note?]``.
 
     Returns a legacy-compatible shape so the existing client code keeps reading
     ``session.client_secret.value`` and ``session.client_secret.expires_at``.
     """
-    instructions = VOICE_SYSTEM_PROMPT
-    if instructions_suffix:
-        instructions = instructions + "\n\n" + instructions_suffix
+    parts = [VOICE_SYSTEM_PROMPT]
+    for s in (instructions_suffixes or []):
+        if s and s.strip():
+            parts.append(s.strip())
+    instructions = "\n\n".join(parts)
     transcription_prompt = (
         "Gary Gurevich, Crunchy Numbers, Crunchy Tools, Flowocity, Hermes, "
         "Jerome, Claude, OpenClaw, Paperclip, Rillet, Pat Leahy, "
@@ -382,7 +513,7 @@ async def _mint_realtime_session(instructions_suffix: str | None = None) -> dict
             "type": "realtime",
             "model": OPENAI_REALTIME_MODEL,
             "instructions": instructions,
-            "tools": [ASK_AGENT_TOOL_SCHEMA, TRIAGE_VERDICT_TOOL_SCHEMA],
+            "tools": TOOLKIT_SCHEMAS + [TRIAGE_VERDICT_TOOL_SCHEMA],
             "tool_choice": "auto",
             "output_modalities": ["audio"],
             "max_output_tokens": 1500,
@@ -443,9 +574,14 @@ async def session_mint(request: web.Request) -> web.Response:
     }
     # Triage mode is opt-in via ?mode=triage. Default sessions stay user-driven.
     mode = (request.query.get("mode") or "").strip().lower()
-    suffix = _load_open_loops_brief() if mode == "triage" else None
+    # Dossier first (today's standing context); triage brief second when
+    # opted in (mode-specific doctrine layered over the dossier).
+    dossier_md, dossier_meta = dossier.load_dossier()
+    triage_suffix = _load_open_loops_brief() if mode == "triage" else None
     try:
-        data = await _mint_realtime_session(instructions_suffix=suffix)
+        data = await _mint_realtime_session(
+            instructions_suffixes=[dossier_md, triage_suffix],
+        )
     except httpx.HTTPStatusError as e:
         log.error("ephemeral mint failed: %s %s", e.response.status_code, e.response.text[:300])
         return web.json_response({"error": "ephemeral_mint_failed", "detail": e.response.text[:300]}, status=502)
@@ -455,7 +591,11 @@ async def session_mint(request: web.Request) -> web.Response:
     log_call_event(
         LOG_DIR, conv_id, "session_minted",
         model=OPENAI_REALTIME_MODEL, voice=OPENAI_REALTIME_VOICE,
-        mode=mode or "default", brief_injected=bool(suffix),
+        mode=mode or "default", brief_injected=bool(triage_suffix),
+        dossier_loaded=dossier_meta["loaded"],
+        dossier_chars=dossier_meta["chars"],
+        dossier_age_h=dossier_meta["age_h"],
+        working_state_present=dossier_meta["working_state_present"],
     )
     return web.json_response({"conv_id": conv_id, "session": data, "mode": mode or "default"})
 
@@ -476,74 +616,245 @@ def _structured_unreachable(error_type: str) -> dict:
     }
 
 
-async def ask_agent(request: web.Request) -> web.Response:
-    """Synchronous forward to the backend agent. Returns the answer inline.
+async def ask_agent_gone(request: web.Request) -> web.Response:
+    """Hard cutover marker for stale PWA caches.
 
-    gpt-realtime-2 has GPT-5-class reasoning and native preambles + async
-    function calling, so the prior fast-path / long-poll / task-id machinery
-    is gone — the model itself bridges the wait by speaking to the user.
-    Total wait is capped at ``ASK_AGENT_TIMEOUT_SEC``; ``intent_type`` and
-    ``freshness_required`` are logged for routing telemetry but not branched on.
+    The pre-cutover client called this route with `{conv_id, question, ...}`
+    as the single fat tool. Stale-cache fallthrough into the slow path is
+    exactly the regression this refactor exists to kill, so we 410 and ask
+    the client to reload. The no-cache middleware (`no_cache_static_middleware`)
+    forces shell revalidation on the next visit; one reload restores normal
+    operation.
     """
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    conv_id = body.get("conv_id") or "unknown"
+    log.warning("legacy /api/ask-agent hit — client outdated (conv=%s)", conv_id)
+    log_call_event(LOG_DIR, conv_id, "legacy_ask_agent_blocked")
+    return web.json_response(
+        {
+            "error": "client_outdated",
+            "reload_required": True,
+            "answer": (
+                "Your voice client is out of date — please reload the page. "
+                "The toolkit was upgraded."
+            ),
+        },
+        status=410,
+    )
+
+
+# Dispatch table: tool name → (backend module, function name). The handler
+# below imports lazily so missing backend deps (e.g. ripgrep absent) don't
+# crash mint — they only surface when the tool fires.
+_TOOL_DISPATCH = {
+    "lookup_open_loop":     ("backends.supabase", "lookup_open_loop"),
+    "recent_decisions":     ("backends.supabase", "recent_decisions"),
+    "mission_control_card": ("backends.supabase", "mission_control_card"),
+    "search_notes":         ("backends.notes",    "search_notes"),
+    "calendar":             ("backends.gws",      "calendar"),
+    "gmail_search":         ("backends.gws",      "gmail_search"),
+}
+
+# Per-tool cache TTLs (seconds). Calendar and Gmail need shorter windows so
+# "what's on for the next hour" reflects late additions; static-ish queries
+# (notes, recent_decisions) can ride a longer tail.
+_TOOL_TTL = {
+    "calendar": 120.0,
+    "gmail_search": 90.0,
+    "lookup_open_loop": 180.0,
+    "mission_control_card": 180.0,
+    "recent_decisions": 300.0,
+    "search_notes": 300.0,
+}
+
+
+async def tool_dispatch(request: web.Request) -> web.Response:
+    """Generic dispatch for the granular toolkit.
+
+    Browser POSTs `{conv_id, name, args}` (or path param `/api/tool/<name>`).
+    Handler looks up the backend, runs it with a TTL cache, returns JSON,
+    and appends a tool turn to the conversation transcript.
+    """
+    name = request.match_info.get("name", "")
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
     conv_id = body.get("conv_id")
-    question = (body.get("question") or "").strip()
-    intent_type = (body.get("intent_type") or "unknown").strip() or "unknown"
-    freshness_required = bool(body.get("freshness_required"))
+    args = body.get("args") if isinstance(body.get("args"), dict) else {}
+    if not name:
+        return web.json_response({"error": "missing_tool"}, status=400)
     conv = CONVERSATIONS.get(conv_id) if conv_id else None
     if conv is None:
         return web.json_response({"error": "unknown_conv_id"}, status=400)
     _ensure_conv_shape(conv)
-    if not question:
-        return web.json_response({"answer": "(empty question)"}, status=200)
-
+    entry = _TOOL_DISPATCH.get(name)
+    if entry is None:
+        return web.json_response({"error": "unknown_tool", "name": name}, status=404)
+    module_name, fn_name = entry
     _touch(conv)
     started_at = time.time()
-    prior_ask_count = sum(1 for e in conv["entries"] if e.get("role") == "tool_question")
-    log.info("ask_agent [%s] (%s, fresh=%s): %s",
-             conv_id, intent_type, freshness_required, question[:120])
     log_call_event(
-        LOG_DIR, conv_id, "ask_agent_spawned",
-        chars=len(question),
-        intent_type=intent_type, freshness_required=freshness_required,
-        prior_ask_count=prior_ask_count,
+        LOG_DIR, conv_id, "tool_call_spawned",
+        tool=name, args_keys=list(args.keys()),
     )
     error_type: str | None = None
+    cache_hit = False
     try:
-        answer = await _agent_chat(conv_id, question)
-        status = "done"
-    except asyncio.TimeoutError:
-        # Outer wall-clock cap fired (ASK_AGENT_TIMEOUT_SEC).
-        answer = _structured_unreachable("runaway")["answer"]
-        status = "error"
-        error_type = "runaway"
-    except httpx.ReadTimeout:
-        # Idle-gap watchdog fired: backend went silent mid-stream.
-        answer = _structured_unreachable("idle")["answer"]
-        status = "error"
-        error_type = "idle"
-    except httpx.TimeoutException:
-        answer = _structured_unreachable("timeout")["answer"]
-        status = "error"
-        error_type = "timeout"
+        from importlib import import_module
+        mod = import_module(module_name)
+        fn = getattr(mod, fn_name)
+        from backends import cache
+        result, cache_hit = await cache.memoize(
+            name, args, lambda: fn(**args), ttl_sec=_TOOL_TTL.get(name),
+        )
+    except TypeError as e:
+        # Bad args (missing required, wrong types). Surface to the model as a
+        # structured error so it can re-call with the right shape.
+        result = {"error": "bad_args", "detail": str(e)[:200]}
+        error_type = "bad_args"
     except Exception as e:  # noqa: BLE001
-        log.exception("ask_agent failed")
-        answer = _structured_unreachable(type(e).__name__)["answer"]
-        status = "error"
+        log.exception("tool dispatch failed (%s)", name)
+        result = {"error": "tool_failed", "detail": type(e).__name__}
         error_type = type(e).__name__
     finished_at = time.time()
     latency_ms = int((finished_at - started_at) * 1000)
+    chars = len(json.dumps(result, default=str)) if result is not None else 0
     log_call_event(
-        LOG_DIR, conv_id, "ask_agent_done",
+        LOG_DIR, conv_id, "tool_call_done",
+        tool=name, latency_ms=latency_ms, chars=chars,
+        cache_hit=cache_hit, error_type=error_type,
+    )
+    # Persist a tool turn so the transcript has the structured I/O even
+    # though the model only ever sees its own paraphrase in audio.
+    conv["entries"].append({
+        "role": "tool_question",
+        "text": f"{name}({json.dumps(args, default=str)})",
+        "ts": started_at,
+    })
+    conv["entries"].append({
+        "role": "tool_answer",
+        "text": json.dumps(result, default=str)[:6000],
+        "ts": finished_at,
+    })
+    conv["last_activity_ts"] = finished_at
+    return web.json_response({"ok": True, "result": result})
+
+
+async def deep_research(request: web.Request) -> web.Response:
+    """The one slow path. Streams from the agent backend, emits milestone
+    events on markdown section boundaries, and assembles the final answer.
+
+    Response is SSE: each line `data: <json>\\n\\n`. Browser injects each
+    milestone into the Realtime conversation as a system message so the
+    voice model can narrate progress between utterances. On `done`, the
+    browser feeds the assembled answer back as `function_call_output`.
+    """
+    body = await request.json()
+    conv_id = body.get("conv_id")
+    prompt = (body.get("prompt") or "").strip()
+    scope = (body.get("scope") or "reasoning").strip()
+    expected_seconds = body.get("expected_seconds")
+    conv = CONVERSATIONS.get(conv_id) if conv_id else None
+    if conv is None:
+        return web.json_response({"error": "unknown_conv_id"}, status=400)
+    _ensure_conv_shape(conv)
+    if not prompt:
+        return web.json_response({"error": "empty_prompt"}, status=400)
+    _touch(conv)
+    started_at = time.time()
+    log_call_event(
+        LOG_DIR, conv_id, "deep_research_spawned",
+        chars=len(prompt), scope=scope, expected_seconds=expected_seconds,
+    )
+
+    resp = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+    await resp.prepare(request)
+
+    async def _send(payload: dict) -> None:
+        line = "data: " + json.dumps(payload, default=str) + "\n\n"
+        await resp.write(line.encode("utf-8"))
+
+    chunks: list[str] = []
+    last_milestone_ts = 0.0
+    pending_section = ""
+    pending_buffer = ""
+
+    async def _emit_milestone(section: str, text: str) -> None:
+        nonlocal last_milestone_ts
+        now = time.time()
+        if now - last_milestone_ts < 3.0:
+            return
+        last_milestone_ts = now
+        snippet = text.strip().replace("\n", " ")[:120]
+        if not snippet:
+            return
+        await _send({"type": "milestone", "section": section or "progress", "text": snippet})
+
+    status = "done"
+    error_type: str | None = None
+    try:
+        async for piece in _agent_chat_stream(conv_id, prompt):
+            chunks.append(piece)
+            pending_buffer += piece
+            # Section boundary: line starting with `## ` (Markdown H2).
+            while "\n## " in pending_buffer or pending_buffer.startswith("## "):
+                if pending_buffer.startswith("## "):
+                    idx = 0
+                else:
+                    idx = pending_buffer.find("\n## ") + 1
+                head = pending_buffer[:idx].strip()
+                if head and pending_section:
+                    await _emit_milestone(pending_section, head)
+                rest = pending_buffer[idx:]
+                # Extract the new section heading text up to the next newline.
+                newline = rest.find("\n")
+                if newline < 0:
+                    pending_section = rest[3:].strip()[:60]
+                    pending_buffer = ""
+                    break
+                pending_section = rest[3:newline].strip()[:60]
+                pending_buffer = rest[newline + 1:]
+    except asyncio.TimeoutError:
+        status = "error"; error_type = "runaway"
+    except httpx.ReadTimeout:
+        status = "error"; error_type = "idle"
+    except httpx.TimeoutException:
+        status = "error"; error_type = "timeout"
+    except Exception as e:  # noqa: BLE001
+        log.exception("deep_research stream failed")
+        status = "error"; error_type = type(e).__name__
+    # Flush any trailing buffered section text as a final milestone before done.
+    if pending_buffer.strip() and pending_section:
+        await _emit_milestone(pending_section, pending_buffer.strip())
+
+    answer = "".join(chunks).strip()
+    if status == "error" and not answer:
+        answer = _AGENT_UNREACHABLE_SENTINEL + " - please ask the user to repeat that."
+    finished_at = time.time()
+    latency_ms = int((finished_at - started_at) * 1000)
+    log_call_event(
+        LOG_DIR, conv_id, "deep_research_done",
         latency_ms=latency_ms, chars=len(answer),
         status=status, error_type=error_type,
+        milestones_emitted=int(last_milestone_ts > 0),
     )
-    # Persist the question/answer pair to the transcript even if the conv was
-    # popped mid-call by /api/end (the dict survives via this closure ref).
-    conv["entries"].append({"role": "tool_question", "text": question, "ts": started_at})
+    conv["entries"].append({"role": "tool_question", "text": prompt, "ts": started_at})
     conv["entries"].append({"role": "tool_answer", "text": answer, "ts": finished_at})
     conv["last_activity_ts"] = finished_at
-    return web.json_response({"answer": answer, "status": status})
+    await _send({"type": "done", "answer": answer, "status": status, "error_type": error_type})
+    await resp.write_eof()
+    return resp
 
 
 async def text_turn(request: web.Request) -> web.Response:
@@ -594,9 +905,9 @@ async def resume_call(request: web.Request) -> web.Response:
     if not OPENAI_API_KEY:
         return web.json_response({"error": "no_openai_key"}, status=500)
     note = (conv.get("handoff_note") or "").strip()
-    suffix = None
+    handoff_suffix = None
     if note:
-        suffix = (
+        handoff_suffix = (
             "Continuation context from earlier in this same call: "
             + note
             + "\n\nCritical: do not greet, do not acknowledge any pause, do "
@@ -604,8 +915,13 @@ async def resume_call(request: web.Request) -> web.Response:
             + "where you left off in topic and tone. Wait for the user's next "
             + "utterance before responding."
         )
+    # On resume we still want the dossier present — same standing context as
+    # the original mint; the handoff note layers on top for in-call continuity.
+    dossier_md, _ = dossier.load_dossier()
     try:
-        data = await _mint_realtime_session(instructions_suffix=suffix)
+        data = await _mint_realtime_session(
+            instructions_suffixes=[dossier_md, handoff_suffix],
+        )
     except httpx.HTTPStatusError as e:
         log.error("resume mint failed: %s %s", e.response.status_code, e.response.text[:300])
         return web.json_response({"error": "ephemeral_mint_failed", "detail": e.response.text[:300]}, status=502)
@@ -638,8 +954,11 @@ async def premint_session(request: web.Request) -> web.Response:
         return web.json_response({"expired": True})
     if not OPENAI_API_KEY:
         return web.json_response({"error": "no_openai_key"}, status=500)
+    # Pre-mint inherits the dossier (handoff note layered server-side during
+    # the actual swap-in via /api/resume).
+    dossier_md, _ = dossier.load_dossier()
     try:
-        data = await _mint_realtime_session()
+        data = await _mint_realtime_session(instructions_suffixes=[dossier_md])
     except httpx.HTTPStatusError as e:
         log.error("premint mint failed: %s %s", e.response.status_code, e.response.text[:300])
         return web.json_response({"error": "ephemeral_mint_failed", "detail": e.response.text[:300]}, status=502)
@@ -702,6 +1021,13 @@ async def end_call(request: web.Request) -> web.Response:
         agent_base=AGENT_API_BASE,
         agent_key=AGENT_API_KEY,
     ))
+    # Extract working state from this call, then refresh the dossier so the
+    # next session sees both. Ordering matters: extract → refresh; never
+    # blocks the live response.
+    dossier.schedule_extract(
+        conv_id, all_entries,
+        agent_base=AGENT_API_BASE, agent_key=AGENT_API_KEY,
+    )
     slack_posted = False
     if SLACK_BOT_TOKEN and SLACK_CALL_CHANNEL_ID:
         asyncio.create_task(post_to_slack(
@@ -775,6 +1101,12 @@ async def _reap_stale_conversations() -> None:
                     channel_id=SLACK_CALL_CHANNEL_ID,
                 ))
                 slack_posted = True
+            # Same extract → refresh chain as end_call. Idle-reaped calls still
+            # produce signal worth carrying forward to the next session.
+            dossier.schedule_extract(
+                cid, all_entries,
+                agent_base=AGENT_API_BASE, agent_key=AGENT_API_KEY,
+            )
             log.info("reaped idle conversation %s (>%dmin no activity)", cid, REAPER_IDLE_TIMEOUT_SEC // 60)
             log_call_event(
                 LOG_DIR, cid, "reaped",
@@ -788,6 +1120,20 @@ async def _reap_stale_conversations() -> None:
 
 async def _start_reaper(app: web.Application) -> None:
     app["reaper_task"] = asyncio.create_task(_reap_stale_conversations())
+
+
+async def _start_dossier_refresh(app: web.Application) -> None:
+    """Fire-and-forget dossier refresh at server boot.
+
+    Never blocks startup — mint reads whatever's on disk and gracefully
+    skips when stale, so a slow agent backend at boot doesn't keep the
+    server from accepting calls.
+    """
+    if not AGENT_API_KEY:
+        return
+    asyncio.create_task(
+        dossier.refresh_dossier(agent_base=AGENT_API_BASE, agent_key=AGENT_API_KEY)
+    )
 
 
 async def _stop_reaper(app: web.Application) -> None:
@@ -857,10 +1203,15 @@ async def no_cache_static_middleware(request: web.Request, handler):
 def make_app() -> web.Application:
     app = web.Application(middlewares=[tailnet_middleware, no_cache_static_middleware], client_max_size=8 * 1024 * 1024)
     app.on_startup.append(_start_reaper)
+    app.on_startup.append(_start_dossier_refresh)
     app.on_cleanup.append(_stop_reaper)
     app.router.add_get("/api/health", health)
     app.router.add_post("/api/session", session_mint)
-    app.router.add_post("/api/ask-agent", ask_agent)
+    # Legacy `/api/ask-agent` is hard-cut to 410 so stale PWA caches can't
+    # silently regress into the slow path — see `ask_agent_gone`.
+    app.router.add_post("/api/ask-agent", ask_agent_gone)
+    app.router.add_post("/api/tool/{name}", tool_dispatch)
+    app.router.add_post("/api/deep-research", deep_research)
     app.router.add_post("/api/client-event", client_event)
     app.router.add_post("/api/text-turn", text_turn)
     app.router.add_post("/api/resume", resume_call)

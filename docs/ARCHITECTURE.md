@@ -3,9 +3,11 @@
 A live, interruptible voice line to your own agent. The pieces:
 
 - **Browser PWA** (`web/`, vanilla JS) — UI + WebRTC peer to OpenAI.
-- **OpenAI Realtime API** — voice (`gpt-realtime-2`, GPT-5-class reasoning, 128K context, native preambles + async function calling). Browser holds a direct WebRTC peer with OpenAI; audio never transits the sidecar.
-- **Sidecar** (`server.py`, aiohttp) — mints OpenAI ephemeral sessions, synchronously forwards `ask_agent`, owns conversation state, persists transcripts.
-- **Your agent backend** — anything exposing an OpenAI-compatible `/v1/chat/completions` SSE endpoint. Receives a per-conversation `X-Session-Id: voice-{conv_id}` header so it can track memory across resumes. (Phase 2: this contract migrates to remote MCP via Tailscale Funnel — see end of doc.)
+- **OpenAI Realtime API** — voice (`gpt-realtime-2`, GPT-5-class reasoning, 128K context, native parallel function calling, native preambles + async function calling). Browser holds a direct WebRTC peer with OpenAI; audio never transits the sidecar.
+- **Sidecar** (`server.py`, aiohttp) — mints OpenAI ephemeral sessions, dispatches the granular toolkit to direct backends, streams `deep_research`, owns conversation state, persists transcripts.
+- **Dossier** (`dossier.py` + `~/.hermes/dossier/today.json`) — structured "today's standing context" (open loops, calendar, recent decisions, hot people, last call's working state) regenerated on boot and after every call. Rendered as markdown and injected into every session's instructions. This is what makes the voice agent feel deeply contextual from second 1 instead of "generic until deep dive."
+- **Direct backends** (`backends/`) — `supabase` (Mission Control cards/journal), `gws` (Calendar/Gmail via the `gws-as.sh` wrapper), `notes` (Obsidian vault via ripgrep), `cache` (TTL memo). No LLM in the dispatch path — narrow tool calls land in 50ms–1.5s.
+- **Your agent backend** — anything exposing an OpenAI-compatible `/v1/chat/completions` SSE endpoint. Receives a per-conversation `X-Session-Id: voice-{conv_id}` header. Now reached only via `deep_research` (the one slow tool), the dossier refresher, and the post-call working-state extractor. (Phase D: small tools migrate to remote MCP transport via Tailscale Funnel — see end of doc.)
 - **Optional messaging adapter** — Slack today; see [ADAPTERS.md](ADAPTERS.md).
 
 ## The durable conversation
@@ -45,15 +47,25 @@ Backgrounding is a **pause**, not an end. Only the explicit End button or `pageh
    pagehide / End button   : POST /api/end (true close)
 ```
 
-## Flow: substantive turn (`ask_agent`)
+## Flow: tool turns (the May 2026 cutover)
 
-1. User speaks. Realtime model decides to call `ask_agent` (per system prompt) and emits a native preamble ("let me check that").
-2. Browser POSTs `/api/ask-agent` with `{conv_id, question, call_id, intent_type, freshness_required}`.
-3. Sidecar synchronously forwards to the backend's `/v1/chat/completions` and returns the answer inline. Total wait capped at `ASK_AGENT_TIMEOUT_SEC` (default 90s).
-4. While the call is in flight, the browser renders a "Consulting deep context: [topic]" status chip on the assistant's bubble (live-updates as `response.function_call_arguments.delta` streams). The chip phrasing describes the action, not the architecture — never exposes the split-brain seam.
-5. Async function calling means the model continues the conversation through the wait. No client-side polling, no in-call icebreaker, no hand-coded bridging.
-6. When the answer arrives, browser feeds it to the realtime peer via `function_call_output`. The model speaks it. The chip fades out; the answer renders in a markdown bubble for display.
-7. Sidecar appends both turns to `conv["entries"]` via the local conv ref — survives concurrent `/api/end` pop.
+Substantive turns split into two paths. The model is told to prefer the narrowest applicable tool and fan small ones out in parallel; `deep_research` is reserved for novel reasoning, drafting, or synthesis no narrow tool covers.
+
+### Narrow tools (50ms–1.5s, direct backend)
+
+1. User speaks. Realtime model picks the right tool — often several in parallel — based on the dossier + this call's context.
+2. Browser POSTs `/api/tool/<name>` with `{conv_id, args}`. Each call gets its own per-tool consulting chip ("Pulling calendar…", "Searching email…").
+3. Sidecar routes to `backends/<module>.<fn>` via the dispatch table in `_TOOL_DISPATCH`. Result memoized via `backends.cache.memoize` with per-tool TTL.
+4. Structured JSON returned to browser → `sendFunctionOutput(call_id, JSON.stringify(result))` → Realtime model addresses fields directly ("the ten o'clock with Pat") instead of paraphrasing prose.
+5. Sidecar appends a structured tool turn to `conv["entries"]` and the per-call NDJSON (`tool_call_spawned` / `tool_call_done` with `tool`, `latency_ms`, `cache_hit`, `error_type`).
+
+### `deep_research` (30–240s, streaming SSE)
+
+1. User asks something that genuinely requires the slow path. Model calls `deep_research(prompt, scope, expected_seconds)` and tells the user roughly how long ("this'll take about a minute, I'll narrate as I go").
+2. Browser POSTs `/api/deep-research`, reads the SSE stream.
+3. Sidecar streams chunks from `_agent_chat_stream`, detects markdown section boundaries (`\n## ` headers), and emits `{type:"milestone", section, text}` events on a 3-second server-side throttle.
+4. Browser injects each milestone into the Realtime conversation as a system message: `{type:"conversation.item.create", item:{role:"system", content:[{type:"input_text", text:"[research-finding] section=…: …"}]}}`. The voice model narrates progress between utterances; the consulting chip ticks through latest section.
+5. On the final `{type:"done", answer}`, browser sends `function_call_output` with the assembled answer. Model speaks the synthesis.
 
 ## Flow: backgrounding / forced reconnect
 
@@ -110,10 +122,14 @@ Polls every 60s. Conversations with no activity for 20min are reaped: transcript
 - **Realtime + separate brain rather than monolithic.** Voice latency and persona stay tight on `gpt-realtime-2`; substantive cognition stays with the agent backend (full memory, skills, tool access). The two are bridged by the `ask_agent` proxy today.
 - **No mid-call Slack updates.** Slack thread is a single post at end-of-call (or reap). Per-turn pings are noisy and the user can read the transcript locally.
 
-## Phase 2 (deferred): native remote MCP
+## Phase D (deferred): remote-MCP transport for narrow tools
 
-The next architectural move is to expose `ask_hermes` as a remote MCP server (HTTP/SSE transport) and switch the Realtime session config to `tools: [{type: "mcp", server_url: ...}]`. OpenAI's servers then dispatch the tool call directly to the MCP endpoint, saving the WebRTC data-channel round-trip (~30-100 ms per call).
+The narrow toolkit is implemented as function tools today (browser POSTs to `/api/tool/<name>`). gpt-realtime-2 natively supports remote MCP servers in the same session — OpenAI dispatches MCP calls directly without browser round-trip. Phase D swaps the small-tool transport: stand up an MCP server endpoint in `server.py` over Tailscale Funnel, configure the session with `{type:"mcp", server_url, allowed_tools, require_approval:"never", headers}`, remove the `/api/tool/<name>` routes and the browser dispatch table for migrated tools. `deep_research` and `triage_verdict` stay function tools (MCP doesn't stream responses; `deep_research` needs streaming).
 
-Constraints: native remote MCP requires a public URL OpenAI's servers can reach — incompatible with TTYC's local-first default. The deployment-mode answer is **Tailscale Funnel**: expose `https://<tailnet>.ts.net/mcp` with API-key header auth, MCP server runs in `server.py` alongside the existing routes. Local-first principle is preserved in spirit (data stays on the machine; only the request channel is public).
+**Decision gate**: ship Phase D only if Phase B's per-tool latency p50 ≥ 300ms (suggesting WebRTC round-trip is a meaningful share) AND `in_context_followup_rate` plateaus below 0.8. If backend latency already dominates, defer.
 
 When delivered, this also redefines PRD criterion #9 from "portable across chat-completions backends" to "portable across MCP-speaking backends."
+
+## Phase E (future): mid-call dossier refresh + `note_to_self`
+
+After Phase D, expose `get_dossier()` and `note_to_self(text)` as MCP tools so the model can refresh working memory mid-call and persist observations durably. Closes the loop on "the model can edit its own working memory."

@@ -35,12 +35,16 @@ if [[ -d "$DEST/web" && ! -L "$DEST/web" ]]; then
 fi
 
 echo "symlinking source files from $SRC"
-for f in server.py events.py transcripts.py auth.py; do
+for f in server.py events.py transcripts.py auth.py dossier.py; do
   rm -f "$DEST/$f"
   ln -s "$SRC/$f" "$DEST/$f"
 done
 rm -rf "$DEST/web"
 ln -s "$SRC/web" "$DEST/web"
+# Granular toolkit backends (May 2026 cutover). Symlinked as a directory so
+# Python resolves the package via the real path.
+rm -rf "$DEST/backends"
+ln -s "$SRC/backends" "$DEST/backends"
 
 # Make the existing .hermes-api-key visible under the new name the new
 # server.py looks for. (Symlink, not copy -- single source of truth.)

@@ -193,14 +193,39 @@ function fadeOutConsultingChip(div) {
   div.style.opacity = "0";
   setTimeout(() => { try { div.remove(); } catch {} }, 500);
 }
-// Pull the question value from a partial JSON args buffer. Args stream in
-// before the .done event, and partial JSON can't be parsed, so we extract
-// the in-progress "question" string directly.
-function extractStreamingQuestion(argsBuffer) {
-  if (!argsBuffer) return null;
-  const m = argsBuffer.match(/"question"\s*:\s*"((?:[^"\\]|\\.)*)/);
+// Per-tool consulting-chip phrasing. Phrasing describes the action for the
+// user — never references "brain", "agent", "model" (exposing the split-brain
+// seam is bad UX). Each entry pulls a topic out of the streaming args buffer
+// so the chip can live-update as the model formulates the call.
+const TOOL_CHIPS = {
+  lookup_open_loop:     { idle: "Looking up that loop…",    key: "id" },
+  recent_decisions:     { idle: "Pulling recent decisions…", key: "days", prefix: "Recent decisions (last " , suffix: "d)" },
+  search_notes:         { idle: "Searching your notes…",    key: "query", prefix: "Searching notes: " },
+  calendar:             { idle: "Checking your calendar…",  key: "when",  prefix: "Calendar: " },
+  gmail_search:         { idle: "Searching email…",         key: "query", prefix: "Email: " },
+  mission_control_card: { idle: "Pulling that card…",       key: "id" },
+  deep_research:        { idle: "Researching…",             key: "prompt", prefix: "Researching: " },
+};
+
+// Pull a string arg value from a partial-JSON args buffer. Args stream in
+// before .done arrives, and partial JSON can't be parsed normally; we
+// fish out the in-progress string for the requested key.
+function extractStreamingArg(argsBuffer, key) {
+  if (!argsBuffer || !key) return null;
+  const re = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)`);
+  const m = argsBuffer.match(re);
   if (!m) return null;
   return m[1].replace(/\\n/g, " ").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+}
+
+// Topic string for the consulting chip, given a tool name and an args buffer
+// (which may be partial JSON). Falls back to the idle phrasing.
+function topicForTool(toolName, argsBuffer) {
+  const cfg = TOOL_CHIPS[toolName];
+  if (!cfg) return null;
+  const value = extractStreamingArg(argsBuffer, cfg.key);
+  if (!value) return null;
+  return `${cfg.prefix || ""}${value}${cfg.suffix || ""}`.trim();
 }
 
 function setBubbleText(div, text) {
@@ -806,12 +831,13 @@ function onDcMessage(ev) {
       if (item.type === "function_call") {
         fnCallBuffers.set(item.call_id, { name: item.name, args: "" });
         logClientEvent("client_function_call_arrived", { name: item.name, call_id: item.call_id });
-        if (item.name === "ask_agent") {
-          // Subtle status chip describing the action — phrasing intentionally
-          // hides the split-brain seam (no "asking your brain" / "calling the
-          // agent" framing).
+        // Spawn a per-tool consulting chip for any tool whose phrasing we know.
+        // Parallel calls each get their own chip via separate call_ids.
+        const cfg = TOOL_CHIPS[item.name];
+        if (cfg) {
           const chipDiv = showConsultingChip();
-          consultingChips.set(item.call_id, { chipDiv, throttled: false });
+          updateConsultingChip(chipDiv, cfg.idle);
+          consultingChips.set(item.call_id, { chipDiv, throttled: false, toolName: item.name });
         }
       }
       break;
@@ -826,8 +852,8 @@ function onDcMessage(ev) {
         entry.throttled = true;
         requestAnimationFrame(() => {
           entry.throttled = false;
-          const topic = extractStreamingQuestion(buf?.args || "");
-          updateConsultingChip(entry.chipDiv, topic);
+          const topic = topicForTool(entry.toolName, buf?.args || "");
+          if (topic) updateConsultingChip(entry.chipDiv, topic);
         });
       }
       break;
@@ -841,17 +867,11 @@ function onDcMessage(ev) {
       fnCallBuffers.delete(msg.call_id);
       // Final, complete topic update on the chip.
       const entry = consultingChips.get(msg.call_id);
-      if (entry && args.question) updateConsultingChip(entry.chipDiv, args.question);
-      if (name === "ask_agent") {
-        handleAskAgent(msg.call_id, args.question || "", {
-          intent_type: typeof args.intent_type === "string" ? args.intent_type : null,
-          freshness_required: typeof args.freshness_required === "boolean" ? args.freshness_required : null,
-        });
-      } else if (name === "triage_verdict") {
-        handleTriageVerdict(msg.call_id, args);
-      } else {
-        sendFunctionOutput(msg.call_id, JSON.stringify({ error: `unknown tool ${name}` }));
+      if (entry) {
+        const final = topicForTool(name, JSON.stringify(args));
+        if (final) updateConsultingChip(entry.chipDiv, final);
       }
+      dispatchToolCall(msg.call_id, name, args);
       break;
     }
 
@@ -897,47 +917,197 @@ function sendFunctionOutput(call_id, output) {
   send({ type: "response.create" });
 }
 
-// Synchronous forward to the backend agent. gpt-realtime-2's async function
-// calling keeps the conversation flowing in the audio channel during the
-// wait — no client-side polling, no icebreaker, no in-call status interrupt.
-async function handleAskAgent(callId, question, routing) {
-  let answer = "";
-  const intentType = routing && typeof routing.intent_type === "string" ? routing.intent_type : null;
-  const freshnessRequired = routing && typeof routing.freshness_required === "boolean" ? routing.freshness_required : null;
+// Tool dispatch: route a completed function_call to the right handler.
+// Narrow tools share one handler; `deep_research` gets a streaming reader;
+// `triage_verdict` keeps its existing path.
+const NARROW_TOOLS = new Set([
+  "lookup_open_loop", "recent_decisions", "search_notes",
+  "calendar", "gmail_search", "mission_control_card",
+]);
+
+function dispatchToolCall(callId, name, args) {
+  if (NARROW_TOOLS.has(name)) {
+    handleNarrowTool(callId, name, args);
+  } else if (name === "deep_research") {
+    handleDeepResearch(callId, args);
+  } else if (name === "triage_verdict") {
+    handleTriageVerdict(callId, args);
+  } else {
+    sendFunctionOutput(callId, JSON.stringify({ error: `unknown_tool: ${name}` }));
+  }
+}
+
+function closeConsultingChip(callId) {
+  const entry = consultingChips.get(callId);
+  if (entry) {
+    fadeOutConsultingChip(entry.chipDiv);
+    consultingChips.delete(callId);
+  }
+}
+
+// Generic handler for narrow tools — all dispatch through /api/tool/<name>
+// with `{conv_id, args}`. Backend returns small structured JSON; we feed
+// it as the function_call_output verbatim so the model can address fields.
+async function handleNarrowTool(callId, name, args) {
+  let result;
+  let bubbleText;
   try {
-    const r = await fetch("/api/ask-agent", {
+    const r = await fetch(`/api/tool/${encodeURIComponent(name)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        conv_id: convId,
-        question,
-        call_id: callId,
-        intent_type: intentType,
-        freshness_required: freshnessRequired,
-      }),
+      body: JSON.stringify({ conv_id: convId, args }),
     });
+    if (r.status === 410) {
+      const data = await r.json().catch(() => ({}));
+      appendBubble("system",
+        data.answer || "Voice client outdated — please reload the page.");
+      sendFunctionOutput(callId, JSON.stringify({ error: "client_outdated" }));
+      closeConsultingChip(callId);
+      return;
+    }
     const data = await r.json();
-    answer = data.answer || "";
+    result = data.result;
+    bubbleText = formatToolResultForBubble(name, args, result);
   } catch (e) {
-    answer = `Agent is temporarily unreachable - ${e.message}`;
+    result = { error: "client_network", detail: String(e.message || e) };
+    bubbleText = `Tool ${name} failed: ${e.message || e}`;
   } finally {
-    // Fade out the consulting chip; remove from the active map.
-    const entry = consultingChips.get(callId);
-    if (entry) {
-      fadeOutConsultingChip(entry.chipDiv);
-      consultingChips.delete(callId);
+    closeConsultingChip(callId);
+  }
+  if (bubbleText) {
+    const isError = result && typeof result === "object" && result.error;
+    appendBubble(isError ? "system" : "tool", bubbleText, null, { renderMd: !isError });
+  }
+  // Send the structured JSON back to Realtime as the tool output. Model
+  // can address individual fields ("the 10am with Pat") rather than
+  // paraphrase prose.
+  sendFunctionOutput(callId, JSON.stringify(result == null ? {} : result));
+}
+
+// Streaming deep_research. Reads SSE, injects each `milestone` event into
+// the Realtime conversation as a system message so the voice model can
+// narrate progress between utterances. On `done`, feeds the assembled
+// answer as the function_call_output.
+async function handleDeepResearch(callId, args) {
+  const prompt = (args && args.prompt) || "";
+  let assembled = "";
+  let lastMilestoneInjectedTs = 0;
+  let chipEntry = consultingChips.get(callId);
+
+  function injectMilestone(section, text) {
+    if (!dc || dc.readyState !== "open") return;
+    // Client-side floor on injection rate. Server is already 3s-throttled,
+    // but multiple parallel `deep_research` calls would otherwise stampede.
+    const now = Date.now();
+    if (now - lastMilestoneInjectedTs < 1500) return;
+    lastMilestoneInjectedTs = now;
+    try {
+      dc.send(JSON.stringify({
+        type: "conversation.item.create",
+        item: {
+          type: "message", role: "system",
+          content: [{ type: "input_text",
+            text: `[research-finding] section=${section}: ${text}` }],
+        },
+      }));
+    } catch {}
+    if (chipEntry) updateConsultingChip(chipEntry.chipDiv, `Researching · ${section}: ${text}`);
+  }
+
+  let status = "done";
+  let errorType = null;
+  try {
+    const r = await fetch("/api/deep-research", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conv_id: convId, ...args }),
+    });
+    if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buf = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      // SSE frames separated by blank line. We parse each `data:` line as JSON.
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        for (const line of frame.split("\n")) {
+          if (!line.startsWith("data: ")) continue;
+          let payload;
+          try { payload = JSON.parse(line.slice(6)); } catch { continue; }
+          if (payload.type === "milestone") {
+            injectMilestone(payload.section || "progress", payload.text || "");
+          } else if (payload.type === "done") {
+            assembled = payload.answer || "";
+            status = payload.status || "done";
+            errorType = payload.error_type || null;
+          }
+        }
+      }
+    }
+  } catch (e) {
+    status = "error";
+    errorType = "client_network";
+    assembled = `Agent is temporarily unreachable - ${e.message || e}`;
+  } finally {
+    closeConsultingChip(callId);
+  }
+  if (isErrorAnswer(assembled)) {
+    appendBubble("system", assembled || "(no answer)");
+  } else {
+    appendBubble("tool", assembled || "(no answer)", null, { renderMd: true });
+  }
+  sendFunctionOutput(callId, assembled ||
+    "Agent is temporarily unreachable - please ask the user to repeat that.");
+}
+
+// Human-readable summary of a narrow-tool result for the display bubble.
+// Voice answer is whatever the model speaks; this is display-only.
+function formatToolResultForBubble(name, args, result) {
+  if (result && typeof result === "object" && result.error) {
+    return `**${name}** error: \`${result.error}\`${result.detail ? ` — ${result.detail}` : ""}`;
+  }
+  if (Array.isArray(result)) {
+    if (result.length === 0) return `**${name}**: no results`;
+    if (name === "calendar") {
+      return `**Calendar (${result.length}):**\n` + result.map(e =>
+        `- ${e.start}–${e.end} **${e.title}**` +
+        (e.attendees?.length ? ` _(with ${e.attendees.join(", ")})_` : "")
+      ).join("\n");
+    }
+    if (name === "gmail_search") {
+      return `**Email (${result.length}):**\n` + result.map(m =>
+        `- _${m.from}_ — **${m.subject}** — ${m.snippet}`
+      ).join("\n");
+    }
+    if (name === "search_notes") {
+      return `**Notes (${result.length}):**\n` + result.map(n =>
+        `- \`${n.path}\` — ${n.snippet}`
+      ).join("\n");
+    }
+    if (name === "recent_decisions") {
+      return `**Recent decisions (${result.length}):**\n` + result.map(d =>
+        `- ${d.date} — **${d.decision}**${d.context ? ` — _${d.context}_` : ""}`
+      ).join("\n");
     }
   }
-  // Render answer with markdown for tool-answer bubbles. Voice answers stay
-  // plain; this is display-only enrichment.
-  if (isErrorAnswer(answer)) {
-    appendBubble("system", answer || "(no answer)");
-  } else {
-    appendBubble("tool", answer || "(no answer)", null, { renderMd: true });
+  // Single-object tools (lookup_open_loop, mission_control_card)
+  if (result && typeof result === "object") {
+    if (result.title) {
+      const parts = [`**${result.title}**`];
+      if (result.column) parts.push(`column: \`${result.column}\``);
+      if (result.status) parts.push(`status: \`${result.status}\``);
+      if (result.priority) parts.push(`priority: \`${result.priority}\``);
+      let out = parts.join(" — ");
+      if (result.summary) out += `\n\n${result.summary}`;
+      return out;
+    }
   }
-  // Always feed something back to the realtime peer so it doesn't hang on the
-  // function call. Structured-error sentinel triggers prompt rule #10.
-  sendFunctionOutput(callId, answer || "Agent is temporarily unreachable - please ask the user to repeat that.");
+  return "```json\n" + JSON.stringify(result, null, 2).slice(0, 1500) + "\n```";
 }
 
 async function handleTriageVerdict(callId, args) {
