@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-A local voice sidecar that connects a browser to OpenAI Realtime (the voice/ears) and to a separate agent backend (the brain) via a single function tool. The Realtime model handles speech in/out and tool dispatch; substantive thinking happens behind `ask_agent`, which proxies to the agent over HTTP. This split is the central design choice — see `docs/ARCHITECTURE.md` for the rationale.
+A local voice sidecar that connects a browser to OpenAI Realtime (voice/ears) and to a structured **dossier of standing context** plus a granular **direct-backend toolkit** (Supabase, Google Workspace, Obsidian) so the voice model is deeply contextual from second 1, not "generic until deep dive." A single slow path (`deep_research`) reaches the agent backend for novel reasoning. See `docs/ARCHITECTURE.md` for the rationale.
 
 ## Run / dev commands
 
@@ -12,76 +12,96 @@ A local voice sidecar that connects a browser to OpenAI Realtime (the voice/ears
 # First-time setup
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # then edit OPENAI_API_KEY + AGENT_API_BASE
+cp .env.example .env   # edit OPENAI_API_KEY + AGENT_API_BASE + DOSSIER_PATH
 
 # Run
 python server.py       # serves http://127.0.0.1:8090 by default
 
-# Live deploy (personal Mac Mini sidecar — symlinks source into ~/.hermes-custom/hermes-mini/ and kicks launchd)
+# Live deploy (personal Mac Mini — symlinks source into ~/.hermes-custom/hermes-mini/ and kicks launchd)
 ./sync-to-deploy.sh
 ```
 
-There is no test suite or linter wired up. Verification happens via:
-- **Per-call NDJSON event logs** at `logs/calls/<conv_id>.ndjson` — append-only event-flow trace. First place to look when debugging the WebRTC / Realtime / `ask_agent` interactions.
-- **Voice transcripts** at `$TRANSCRIPT_DIR/*.json` — for UX-quality audits (fragmentation, mis-transcription, language drift). Reading transcripts ≠ reading NDJSON; they reveal different classes of bug.
+No test suite or linter. Verification:
+- **Per-call NDJSON** at `logs/calls/<conv_id>.ndjson` — append-only event trace. First place to look for WebRTC / Realtime / tool interactions.
+- **Voice transcripts** at `$TRANSCRIPT_DIR/*.json` — for UX-quality audits.
+- **`in_context_followup_rate`** in `events.py:compute_routing_metrics` — the headline metric. Fraction of user turns immediately after a tool answer that were served WITHOUT another tool call. Targets: ≥0.6 dossier-only, ≥0.8 full toolkit.
 
-Syntax sanity-check before deploying:
+Syntax sanity-check:
 
 ```bash
-python3 -m py_compile server.py transcripts.py auth.py events.py
+python3 -m py_compile server.py dossier.py events.py transcripts.py auth.py backends/*.py
 node --check web/app.js
 ```
 
 ## Architecture (the parts that span multiple files)
 
-**Three layers:**
-1. **Browser client** (`web/app.js`, vanilla JS, no build step). Holds the WebRTC peer to OpenAI Realtime, the mic stream, the brown-noise icebreaker (used **only** for cap-swap and forced-reconnect — not for in-call tool waits), and forced-reconnect continuity state. Loaded directly via `index.html`.
-2. **Sidecar** (`server.py`, aiohttp). Mints Realtime ephemeral sessions, owns the `CONVERSATIONS` in-memory dict, synchronously forwards `ask_agent` to the agent backend, exposes the resume/premint/handoff endpoints, persists transcripts.
-3. **Agent backend** (external). Reached via `AGENT_API_BASE` (default `http://127.0.0.1:8642`). Speaks OpenAI-style chat-completions SSE. The sidecar streams `_agent_chat()` against it. Bring your own. (Phase 2: this contract migrates to remote MCP via Tailscale Funnel.)
+**Four layers:**
 
-**Two Realtime tools registered per session:** `ask_agent` (core) and `triage_verdict` (open-loops integration; described below).
+1. **Browser** (`web/app.js`, vanilla JS, no build step). WebRTC peer to OpenAI Realtime, mic stream, brown-noise icebreaker (cap-swap / forced-reconnect only — not in-call tool waits), per-tool consulting chips, SSE reader for `deep_research`, forced-reconnect continuity state. Loaded via `index.html`.
+2. **Sidecar** (`server.py`, aiohttp). Mints Realtime ephemerals with the dossier baked into `instructions`. Dispatches `/api/tool/<name>` to `backends/*` (no LLM in path) and `/api/deep-research` to the streaming agent path. Owns `CONVERSATIONS` in-memory dict, persists transcripts.
+3. **Dossier** (`dossier.py` + `~/.hermes/dossier/today.json`). Structured snapshot of today's standing context — open loops, calendar, recent decisions, hot people, last call's working state. Rendered as markdown and prepended to every session's instructions via `_mint_realtime_session(instructions_suffixes=[…])`. Regenerated on server boot and after every call ends (post-call extractor → refresh chain).
+4. **Agent backend** (external). Reached via `AGENT_API_BASE` (default `http://127.0.0.1:8642`). Speaks OpenAI-style chat-completions SSE. Now reached only by: `deep_research`, dossier refresh, post-call working-state extraction, `/api/text-turn`. `X-Session-Id: voice-{conv_id}` header threads continuity.
 
-**`ask_agent` flow:**
-- Realtime emits a `function_call` for `ask_agent` over the data channel.
-- Tool args carry routing telemetry: `intent_type` (lookup/action/drafting/reasoning/verification/other) and `freshness_required` bool. The model is told to answer in-session for clarifications/recaps/comparisons/refinements; only escalate when external/current/cross-session context is genuinely needed. Both fields are logged, not branched on — see `events.py:compute_routing_metrics`.
-- Client POSTs `/api/ask-agent` → server forwards synchronously to the backend → returns the answer inline. No task IDs, no long-poll, no fast-path machinery. gpt-realtime-2's native preambles + async function calling keep the conversation flowing through the wait.
-- The client renders a subtle "Consulting deep context: [topic]" status chip on the assistant's bubble while the call is in flight. Phrasing describes the action, not the architecture (no "asking your brain" / "calling the agent" framing — exposing the split-brain seam is bad UX).
-- Liveness model is two-knob: `ASK_AGENT_IDLE_TIMEOUT_SEC` (default 45s) is the primary watchdog — it drives httpx's `read` timeout, so a backend that goes silent mid-stream raises `ReadTimeout` fast, while a slow-but-streaming call keeps running. `ASK_AGENT_TIMEOUT_SEC` (default 600s) is the outer runaway guard via `asyncio.wait_for`. Failures surface via the `_AGENT_UNREACHABLE_SENTINEL` envelope so prompt rule #10 fires; NDJSON `error_type` is `idle` / `runaway` / `timeout` so post-mortems can tell which fired.
+**Tools registered per session (in `TOOLKIT_SCHEMAS`):**
 
-**`triage_verdict` flow + open-loops integration:**
-- A second function tool registered alongside `ask_agent`. Args: `loop_id`, `verdict ∈ {drop, park, act}`, optional `next_action`, `calendar_when`, `note`.
-- At session-mint, `_load_open_loops_brief()` lazy-imports `~/.hermes-custom/open-loops/brief_format.py`, reads `~/.hermes/open-loops/today.json`, and returns a formatted brief if `generated_at` is today (NY tz). The brief is appended to the system prompt via `instructions_suffix`. Off-window calls get an empty suffix → normal Hermes session.
-- Client routes `triage_verdict` function_calls to `POST /api/triage-verdict` → server validates and appends `{role: "triage_verdict", ...}` to the conv transcript → returns `{recorded: true}` immediately. Reconcile cron (in the open-loops repo) reads these entries from the persisted transcript and creates `[Hermes Draft]`-prefixed calendar events for `act` verdicts.
-- The open-loops repo is an optional sibling. The proxy works fine without it (lazy import, returns `None` on failure).
+| Tool | Latency | Transport | Backend |
+|---|---|---|---|
+| `lookup_open_loop(id)` | ~150ms | function | `backends.supabase` |
+| `recent_decisions(days)` | ~100ms | function | `backends.supabase` |
+| `mission_control_card(id)` | ~150ms | function | `backends.supabase` |
+| `search_notes(query, k)` | 100–3000ms | function | `backends.notes` (ripgrep) |
+| `calendar(when, account)` | ~500ms | function | `backends.gws` (gws-as.sh) |
+| `gmail_search(query, account, limit)` | 500–1500ms | function | `backends.gws` |
+| `deep_research(prompt, scope, expected_seconds)` | 30–240s | SSE | agent backend |
+| `triage_verdict(loop_id, verdict, …)` | <50ms | function | `/api/triage-verdict` |
 
-**Forced-reconnect continuity machinery (load-bearing, non-obvious):**
-Realtime sessions hard-die at the 60-min cap; mobile resumes (visibility, network blip, silent freeze, `session_expired`) all funnel through `triggerResume` → `/api/resume`. Without intervention, the new session is amnesic. Two mechanisms preserve continuity:
+Per-tool TTL cache in `server.py:_TOOL_TTL` keyed on `(tool, args_hash)` via `backends/cache.py`.
 
-1. **Handoff note** — at any forced teardown, the dying Realtime model writes an ≤80-word continuation note for its successor (text-only response, 3.5s deadline, partial-buffer fallback). Persisted via `POST /api/handoff-note`. Client helper: `requestHandoffNote()`. On resume, the server bakes the note into the freshly-minted ephemeral's `instructions` via `_mint_realtime_session(instructions_suffix=…)`. Client `onDcOpen` then echoes the assembled `instructions` + `tools` back via `session.update` as defense against the documented `gpt-realtime` tools-drop quirk (`gpt-realtime-2` GA may have fixed it; kept as belt-and-suspenders).
-2. **60-min cap pre-mint + brown-noise bridge** — at 58:30 the client POSTs `/api/premint-session` to cache a fresh ephemeral; cap-swap fires at `min(59:00, expires_at − 10s)` and reuses `/api/resume`. The `icebreaker` (procedural brown noise via WebAudio) fades in *before* peer teardown and out only after `pc.ontrack` first audio frame on the new peer. Client helpers: `schedulePremint`, `doPremint`, `gracefulCapSwap`, `endIcebreaker`.
+**Narrow-tool flow:**
+- Realtime emits `function_call` over the data channel. Browser POSTs `/api/tool/<name>` with `{conv_id, args}`. Sidecar dispatches through `_TOOL_DISPATCH` table → memoized `backends/*` call → JSON return. Sidecar persists a structured tool turn to the transcript; browser feeds JSON verbatim to Realtime as `function_call_output` so the model addresses fields directly instead of paraphrasing prose. Per-tool consulting chips fade in/out per `call_id`, supporting native parallel function calls on gpt-realtime-2.
 
-(Recent-entries replay was removed in the May 2026 cutover — gpt-realtime-2's 128K context + handoff-note-baked-into-instructions is sufficient. Reintroduce a thin version only if NDJSON shows continuity gaps post-deploy.)
+**`deep_research` flow:**
+- Browser POSTs `/api/deep-research` and reads the SSE stream. Sidecar (`_agent_chat_stream`) streams agent chunks, detects markdown section boundaries (`\n## ` headers), and emits `{type:"milestone", section, text}` events on a 3-second server-side throttle. Browser injects each milestone into the Realtime conversation as `{type:"conversation.item.create", item:{role:"system", content:[{type:"input_text", text:"[research-finding] section=…: …"}]}}` — lands in conversation history without triggering a response, so the voice model can narrate findings between utterances. On `{type:"done"}` browser sends the assembled answer as `function_call_output`. Liveness: `ASK_AGENT_IDLE_TIMEOUT_SEC` (45s) is the primary read-watchdog via httpx; `ASK_AGENT_TIMEOUT_SEC` (600s) is the runaway guard. Errors surface via `_AGENT_UNREACHABLE_SENTINEL` so prompt rule fires.
 
-**Concurrency hazards already handled:**
-- `responseInFlight` tracking + dedicated `response.text.delta`/`done` cases gate handoff-note requests (Realtime allows only one response at a time).
-- Mute state preserved across resume by re-applying `track.enabled = false` after `attachPeer` adds tracks to the new peer.
+**Dossier refresh + post-call working-state extraction:**
+- `dossier.refresh_dossier()`: one agent call with a JSON-only directive → atomic write to `DOSSIER_PATH`. 30-min debounce; `force=True` bypasses. Schema: `{open_loops, calendar_today, recent_decisions, hot_people, last_handoff_summary, working_state_from_last_call}`.
+- `dossier.extract_working_state(conv_id, entries)`: one agent call after a call ends → `{decisions, commitments, open_questions, deltas}` merged into the dossier. This is the cross-call continuity loop — the next session's instructions carry what we just decided/committed/learned.
+- Local-date gating (`DOSSIER_TZ`, default America/New_York): yesterday's dossier is treated as stale at mint time. Mint never blocks on dossier; reads whatever's on disk.
+
+**`triage_verdict` (opt-in via `?mode=triage`):**
+- `_load_open_loops_brief()` lazy-imports `~/.hermes-custom/open-loops/brief_format.py`, appends as a second suffix layered over the dossier. Client routes `triage_verdict` function_calls to `POST /api/triage-verdict`. Reconcile cron (open-loops repo) creates `[Hermes Draft]`-prefixed calendar events for `act` verdicts. Open-loops repo is optional — lazy import returns `None` on failure.
+
+**Forced-reconnect continuity (load-bearing, non-obvious):**
+Realtime sessions hard-die at the 60-min cap; mobile resumes (visibility, network blip, silent freeze, `session_expired`) all funnel through `triggerResume` → `/api/resume`. Two mechanisms preserve continuity:
+
+1. **Handoff note** — dying Realtime model writes an ≤80-word continuation note for its successor (text-only response, 3.5s deadline, partial-buffer fallback). Persisted via `POST /api/handoff-note`. On resume, server bakes the note into the freshly-minted ephemeral's `instructions` alongside the dossier suffix. Client `onDcOpen` echoes assembled `instructions` + `tools` via `session.update` as defense against the legacy `gpt-realtime` tools-drop quirk.
+2. **60-min cap pre-mint + brown-noise bridge** — at 58:30 client POSTs `/api/premint-session`; cap-swap fires at `min(59:00, expires_at − 10s)` and reuses `/api/resume`. Icebreaker (procedural brown noise via WebAudio) fades in *before* peer teardown and out only after `pc.ontrack` first audio frame on the new peer. Client helpers: `schedulePremint`, `doPremint`, `gracefulCapSwap`, `endIcebreaker`.
+
+**Hard cutover on legacy `/api/ask-agent`:** returns 410 `{error:"client_outdated", reload_required:true}`. The `no_cache_static_middleware` already forces shell revalidation; one reload restores normal operation. Stale-cache fallthrough into the slow path is exactly the regression the toolkit refactor exists to kill.
+
+**Concurrency hazards handled:**
+- `responseInFlight` tracking gates handoff-note requests (Realtime allows only one response at a time).
+- Mute state preserved across resume by re-applying `track.enabled = false` after `attachPeer`.
+- Parallel function calls each get their own `call_id`-keyed chip in `consultingChips`; independent fade-out.
 
 ## Key files
 
-- `server.py` — sidecar; endpoints (`/api/session`, `/api/ask-agent`, `/api/text-turn`, `/api/resume`, `/api/premint-session`, `/api/handoff-note`, `/api/end`, `/api/client-event`, `/api/triage-verdict`, `/api/health`).
-- `web/app.js` — browser client; WebRTC peer + dc message switch (`onDcMessage`), `attachPeer`, `onDcOpen`, `triggerResume`, `gracefulCapSwap`, `cleanupCall`, `showConsultingChip`/`updateConsultingChip` (status indicator), markdown renderer for displayed tool-answer bubbles.
-- `events.py` — append-only NDJSON per-call event logger (`log_call_event`); `compute_routing_metrics` derives ask_agent count vs in-session local-answer turns.
-- `transcripts.py` — end-of-call transcript persistence + optional Slack archive.
-- `auth.py` — request auth + CIDR allowlist enforcement.
+- `server.py` — sidecar; routes (`/api/session`, `/api/tool/{name}`, `/api/deep-research`, `/api/text-turn`, `/api/resume`, `/api/premint-session`, `/api/handoff-note`, `/api/end`, `/api/client-event`, `/api/triage-verdict`, `/api/health`). `/api/ask-agent` returns 410.
+- `dossier.py` — structured dossier schema, `render_markdown`, `load_dossier`, `refresh_dossier`, `extract_working_state`, fire-and-forget schedulers.
+- `backends/` — `supabase` (Mission Control), `gws` (Calendar/Gmail), `notes` (Obsidian/ripgrep), `cache` (TTL memo). Pure async functions; designed so Phase D can lift them into an MCP server unchanged.
+- `web/app.js` — WebRTC peer + DC switch (`onDcMessage`), per-tool consulting chips, `dispatchToolCall` table, `handleNarrowTool`, `handleDeepResearch` (SSE reader + system-message milestone injection), `handleTriageVerdict`, forced-reconnect machinery.
+- `events.py` — NDJSON logger; `compute_routing_metrics` derives per-tool counters/latencies, `deep_research_ratio`, `in_context_followup_rate`.
+- `transcripts.py` — end-of-call persistence + optional Slack archive.
+- `auth.py` — request auth + CIDR allowlist.
 
 ## Style
 
 - Conventional commits (`feat:`, `fix:`, `refactor:`, `docs:`, `chore:`).
-- `cleanupCall()` is for **true end** only. Forced reconnects must NOT call it — they need to preserve `convId`, `clientEntries`, the icebreaker, and the AudioContext across the gap. The dedicated `endIcebreaker()` helper exists so the resume path doesn't accidentally close the AudioContext.
+- `cleanupCall()` is for **true end** only. Forced reconnects must NOT call it — they preserve `convId`, `clientEntries`, the icebreaker, and the AudioContext across the gap. `endIcebreaker()` exists so the resume path doesn't accidentally close the AudioContext.
 - `voice` is **locked** after the first audio response. Never re-send it on `session.update` — doing so tears the session down.
-- The `ask_hermes` legacy tool name path exists for back-compat with cached PWA installs. Don't remove without a migration plan.
-- **UX language: describe the action, not the architecture.** Tool-call indicators describe what's happening for the user ("Consulting deep context") — never how the system is doing it ("asking your brain" / "calling the agent"). The split-brain design is an implementation detail; users see a single colleague.
+- **UX language: describe the action, not the architecture.** Tool-call chips describe what's happening for the user ("Searching email…", "Researching: …") — never how the system is doing it. The dossier/toolkit/agent split is an implementation detail; users see a single colleague.
+- New backends go in `backends/` as pure async functions; register in `server.py:_TOOL_DISPATCH` with a TTL in `_TOOL_TTL`. The tool schema lives next to its peers in `server.py` and goes into `TOOLKIT_SCHEMAS`. Browser dispatch picks it up via the `NARROW_TOOLS` set and `TOOL_CHIPS` phrasing table.
 
 ## Security boundaries
 
-The browser never sees `OPENAI_API_KEY` or `AGENT_API_KEY` — both stay server-side. `VOICE_ALLOWED_CIDR` defaults to loopback. Only widen it on a trusted network (Tailscale, WireGuard). Transcripts are plain JSON on disk; `TRANSCRIPT_DIR` is the knob.
+The browser never sees `OPENAI_API_KEY`, `AGENT_API_KEY`, or `SUPABASE_SERVICE_KEY` — all server-side. `VOICE_ALLOWED_CIDR` defaults to loopback; widen only on a trusted network (Tailscale, WireGuard). Transcripts and dossier are plain JSON on disk (`TRANSCRIPT_DIR`, `DOSSIER_PATH`).
